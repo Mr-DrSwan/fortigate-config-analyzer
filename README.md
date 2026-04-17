@@ -52,3 +52,25 @@ GUI/CLI приложение для анализа конфигурации Fort
 
 - `.github/workflows/build-windows-exe.yml`
 - `.github/workflows/build-macos-app.yml`
+- `.github/workflows/ci.yml`
+- `.github/workflows/cd-release.yml`
+
+## Тесты (ветка dev)
+
+Добавлены автотесты `pytest` в `tests/test_parser.py`:
+
+- проверка парсинга `edit/set` блоков из конфигурации;
+- проверка формирования и перевода колонок для firewall правил;
+- smoke-проверка структуры выходного `DataFrame`.
+
+Запуск локально:
+
+- `python3 -m pip install -r requirements.txt`
+- `python3 -m pip install pytest`
+- `pytest -q`
+
+CI/CD логика:
+
+- `CI` (`ci.yml`) запускается на `push/pull_request` в `dev`, `main`, `master` и выполняет тесты;
+- сборочные workflow для Windows/macOS запускаются также на `dev`;
+- `CD Release` (`cd-release.yml`) публикует релиз при пуше тега `v*`.

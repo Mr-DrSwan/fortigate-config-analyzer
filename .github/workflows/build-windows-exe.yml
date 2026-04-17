@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "master"]
+    branches: ["dev", "main", "master"]
 
 jobs:
   build:
