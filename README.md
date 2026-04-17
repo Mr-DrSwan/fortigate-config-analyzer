@@ -2,15 +2,17 @@
 
 ![Forti meme cover](assets/cover-meme.png)
 
-GUI/CLI приложение для анализа конфигурации FortiGate (`.conf`) и экспорта результата в `Excel (.xlsx)`.
+Это приложение разбирает конфиг FortiGate (`.conf`) и делает понятный `Excel (.xlsx)` отчет.
 
-## Что анализирует
+Нужно быстро посмотреть, что настроено в фаерволе? Это как раз для этого.
+
+Что попадает в отчет:
 
 - локальные пользователи и группы;
-- правила фаервола (со всеми доступными полями);
+- правила фаервола (включая много дополнительных полей);
 - IPSec туннели;
 - статические маршруты;
-- NAT (VIP/port-forward);
+- NAT (VIP / port-forward);
 - адреса и группы адресов;
 - VPN пользователи.
 
@@ -19,7 +21,7 @@ GUI/CLI приложение для анализа конфигурации Fort
 - Windows (`.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer.exe
 - macOS (`.app` в zip): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.zip
 
-## Запуск как Python приложение
+## Быстрый старт (Python)
 
 1. Открой терминал в папке проекта:
    - `cd FortiGate_Analyzer`
@@ -32,28 +34,21 @@ GUI/CLI приложение для анализа конфигурации Fort
 
 - `python3 app.py --input "/path/to/fortigate.conf" --output "/path/to/result.xlsx"`
 
-## Локальная сборка Windows
+## Локальная сборка
+
+### Windows
 
 1. `python -m pip install -r requirements.txt`
 2. `pyinstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.exe`
 
-## Локальная сборка macOS
+### macOS
 
 1. `python3 -m pip install -r requirements.txt`
 2. `pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.app`
-
-## CI сборки (GitHub Actions)
-
-В проекте настроены workflow:
-
-- `.github/workflows/build-windows-exe.yml`
-- `.github/workflows/build-macos-app.yml`
-- `.github/workflows/ci.yml`
-- `.github/workflows/cd-release.yml`
 
 ## Тесты (ветка dev)
 
@@ -69,8 +64,16 @@ GUI/CLI приложение для анализа конфигурации Fort
 - `python3 -m pip install pytest`
 - `pytest -q`
 
-CI/CD логика:
+## CI/CD
 
-- `CI` (`ci.yml`) запускается на `push/pull_request` в `dev`, `main`, `master` и выполняет тесты;
-- сборочные workflow для Windows/macOS запускаются также на `dev`;
-- `CD Release` (`cd-release.yml`) публикует релиз при пуше тега `v*`.
+В проекте настроены workflow:
+
+- `.github/workflows/ci.yml` — тесты на `push/pull_request` для `dev`, `main`, `master`;
+- `.github/workflows/build-windows-exe.yml` — сборка Windows;
+- `.github/workflows/build-macos-app.yml` — сборка macOS;
+- `.github/workflows/cd-release.yml` — автопубликация релиза при теге `v*`.
+
+### Как работаем по веткам
+
+- все изменения вносим в `dev`;
+- `main` оставляем под стабильные релизы.

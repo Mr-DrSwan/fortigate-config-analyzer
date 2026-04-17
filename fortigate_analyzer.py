@@ -14,7 +14,7 @@ FortiGate Config Parser - Чистый и рабочий
 import pandas as pd
 import re
 from collections import defaultdict
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 import sys
 import os
 
@@ -24,6 +24,9 @@ class FortigateConfigParser:
         self.config_file = config_file
         self.config_data = self._read_config()
         self.dataframes = {}
+        self.address_objects: Dict[str, Dict[str, str]] = {}
+        self.address_group_objects: Dict[str, Dict[str, str]] = {}
+        self.address_group_members: Dict[str, List[str]] = {}
 
         # Словарь переводов полей firewall
         self.firewall_translations = {
@@ -139,47 +142,187 @@ class FortigateConfigParser:
             sys.exit(1)
 
     def _extract_blocks(self, block_name: str) -> List[Dict]:
-        """Извлекает все блоки определенного типа из конфигурации"""
-        pattern = rf'config {block_name}\s*(.*?)\s*end'
-        matches = re.findall(pattern, self.config_data, re.DOTALL | re.IGNORECASE)
+        """Извлекает все edit/next блоки из нужного config-раздела."""
+        target = f"config {block_name}".lower()
+        lines = self.config_data.splitlines()
+        all_blocks: List[Dict] = []
 
-        if not matches:
-            return []
+        in_target = False
+        config_depth = 0
+        current_block: Dict | None = None
 
-        all_blocks = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
 
-        for match in matches:
-            # Ищем все edit ... next блоки
-            edit_pattern = r'edit\s+(?:"([^"]+)"|(\d+)|([^\s]+))(.*?)(?=next|end)'
-            edit_matches = re.findall(edit_pattern, match, re.DOTALL)
+            lower = line.lower()
 
-            for name1, name2, name3, content in edit_matches:
-                block_name = name1 or name2 or name3
-                block_data = {'_name': block_name}
+            if not in_target:
+                if lower == target:
+                    in_target = True
+                    config_depth = 1
+                continue
 
-                # Извлекаем все set параметры
-                set_pattern = r'set\s+(\S+)\s+(.*?)(?=\s*set\s+|$)'
-                set_matches = re.findall(set_pattern, content, re.DOTALL)
+            # Track nested config/end to stay inside the exact target section.
+            if lower.startswith("config "):
+                config_depth += 1
+                continue
 
-                for param, value in set_matches:
-                    # Чистим значение
-                    value = value.strip()
-                    # Убираем кавычки если они есть
-                    if value.startswith('"') and value.endswith('"'):
-                        value = value[1:-1]
+            if lower == "end":
+                config_depth -= 1
+                if config_depth == 0:
+                    if current_block is not None:
+                        all_blocks.append(current_block)
+                        current_block = None
+                    in_target = False
+                continue
 
-                    # Если значение содержит несколько значений в кавычках
-                    if '"' in value:
-                        # Извлекаем все значения в кавычках
-                        quoted_values = re.findall(r'"([^"]*)"', value)
-                        if quoted_values:
-                            value = ' '.join(quoted_values)
+            # Parse edit/next/set only on top level of this config section.
+            if config_depth != 1:
+                continue
 
-                    block_data[param] = value
+            if lower.startswith("edit "):
+                if current_block is not None:
+                    all_blocks.append(current_block)
+                edit_value = line[5:].strip()
+                if edit_value.startswith('"') and edit_value.endswith('"'):
+                    edit_value = edit_value[1:-1]
+                current_block = {"_name": edit_value}
+                continue
 
-                all_blocks.append(block_data)
+            if lower == "next":
+                if current_block is not None:
+                    all_blocks.append(current_block)
+                    current_block = None
+                continue
+
+            if lower.startswith("set ") and current_block is not None:
+                parts = line.split(maxsplit=2)
+                if len(parts) < 2:
+                    continue
+                param = parts[1]
+                value = parts[2].strip() if len(parts) > 2 else ""
+
+                quoted_values = re.findall(r'"([^"]*)"', value)
+                if quoted_values:
+                    value = " ".join(quoted_values)
+                elif value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+
+                current_block[param] = value
 
         return all_blocks
+
+    @staticmethod
+    def _split_members(value: str) -> List[str]:
+        """Split FortiGate member list into object names."""
+        if not value:
+            return []
+        return [item for item in value.split() if item]
+
+    @staticmethod
+    def parse_existing_object_names(cli_output: str) -> Set[str]:
+        """Parse `edit ...` object names from FortiGate CLI output."""
+        names: Set[str] = set()
+        for raw_line in cli_output.splitlines():
+            line = raw_line.strip()
+            if not line.lower().startswith("edit "):
+                continue
+            value = line[5:].strip()
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            if value:
+                names.add(value)
+        return names
+
+    @staticmethod
+    def _quote(value: str) -> str:
+        escaped = value.replace('"', r'\"')
+        return f'"{escaped}"'
+
+    def _format_set_value(self, key: str, value: str) -> str:
+        if key == "member":
+            members = self._split_members(value)
+            return " ".join(self._quote(member) for member in members)
+        if key in {"subnet", "iprange"}:
+            return value
+        if key in {"comment", "comments", "fqdn", "interface", "associated-interface"}:
+            return self._quote(value)
+        if " " in value:
+            return self._quote(value)
+        return value
+
+    def _build_address_command_block(self, name: str) -> List[str]:
+        obj = self.address_objects.get(name, {})
+        lines = [f'    edit {self._quote(name)}']
+        for key, value in obj.items():
+            if key in {"_name", "uuid"}:
+                continue
+            if value == "":
+                continue
+            lines.append(f"        set {key} {self._format_set_value(key, value)}")
+        lines.append("    next")
+        return lines
+
+    def _build_addrgrp_command_block(self, name: str, color_override: Optional[int] = None) -> List[str]:
+        obj = dict(self.address_group_objects.get(name, {}))
+        if color_override is not None:
+            obj["color"] = str(color_override)
+        lines = [f'    edit {self._quote(name)}']
+        for key, value in obj.items():
+            if key in {"_name", "uuid"}:
+                continue
+            if value == "":
+                continue
+            lines.append(f"        set {key} {self._format_set_value(key, value)}")
+        lines.append("    next")
+        return lines
+
+    def build_transfer_plan(
+        self,
+        selected_addresses: Set[str],
+        selected_groups: Set[str],
+        existing_names: Set[str],
+        group_color_overrides: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, object]:
+        """Build transfer command plan while skipping duplicates on target."""
+        group_color_overrides = group_color_overrides or {}
+        expanded_group_members: Set[str] = set()
+        for group_name in selected_groups:
+            expanded_group_members.update(self.address_group_members.get(group_name, []))
+
+        effective_addresses = set(selected_addresses) | expanded_group_members
+        duplicate_addresses = sorted(name for name in effective_addresses if name in existing_names)
+        duplicate_groups = sorted(name for name in selected_groups if name in existing_names)
+
+        addresses_to_create = sorted(name for name in effective_addresses if name not in existing_names)
+        groups_to_create = sorted(name for name in selected_groups if name not in existing_names)
+
+        command_lines: List[str] = []
+        if addresses_to_create:
+            command_lines.append("config firewall address")
+            for name in addresses_to_create:
+                command_lines.extend(self._build_address_command_block(name))
+            command_lines.append("end")
+            command_lines.append("")
+
+        if groups_to_create:
+            command_lines.append("config firewall addrgrp")
+            for name in groups_to_create:
+                command_lines.extend(self._build_addrgrp_command_block(name, group_color_overrides.get(name)))
+            command_lines.append("end")
+
+        if not command_lines:
+            command_lines = ["# Все выбранные объекты уже существуют на целевом FortiGate."]
+
+        return {
+            "duplicate_addresses": duplicate_addresses,
+            "duplicate_groups": duplicate_groups,
+            "addresses_to_create": addresses_to_create,
+            "groups_to_create": groups_to_create,
+            "commands_text": "\n".join(command_lines).strip(),
+        }
 
     def parse_local_users(self):
         """Парсит локальных пользователей"""
@@ -373,47 +516,57 @@ class FortigateConfigParser:
         print(f"   Найдено: {len(data)}")
 
     def parse_addresses(self):
-        """Парсит адреса и группы адресов"""
+        """Парсит адреса и группы адресов в отдельные таблицы"""
         print("📍 Парсинг адресов...")
-
-        data = []
-
-        # Одиночные адреса
         addresses = self._extract_blocks('firewall address')
-        for idx, addr in enumerate(addresses, 1):
-            addr_type = 'IP/Подсеть'
-            value = addr.get('subnet', addr.get('iprange', addr.get('fqdn', '')))
-
-            if 'fqdn' in addr:
-                addr_type = 'FQDN'
-            elif 'iprange' in addr:
-                addr_type = 'Диапазон IP'
-
-            data.append({
-                '№': idx,
-                'Тип': 'Адрес',
-                'Имя': addr.get('_name', ''),
-                'Тип_адреса': addr_type,
-                'Значение': value,
-                'Комментарий': addr.get('comments', '')
-            })
-
-        # Группы адресов
         addr_groups = self._extract_blocks('firewall addrgrp')
-        start_idx = len(data) + 1
-        for idx, group in enumerate(addr_groups, start_idx):
-            data.append({
-                '№': idx,
-                'Тип': 'Группа_адресов',
-                'Имя': group.get('_name', ''),
-                'Тип_адреса': '',
-                'Значение': '',
-                'Члены': group.get('member', ''),
-                'Комментарий': group.get('comments', '')
+        self.address_objects = {addr.get("_name", ""): addr for addr in addresses if addr.get("_name")}
+        self.address_group_objects = {grp.get("_name", ""): grp for grp in addr_groups if grp.get("_name")}
+
+        # Map address -> groups where it is a member.
+        address_to_groups: Dict[str, List[str]] = {}
+        for group in addr_groups:
+            group_name = group.get('_name', '')
+            members = self._split_members(group.get('member', ''))
+            self.address_group_members[group_name] = members
+            for member in members:
+                address_to_groups.setdefault(member, []).append(group_name)
+
+        addresses_data = []
+        for addr in addresses:
+            name = addr.get('_name', '')
+            groups = sorted(address_to_groups.get(name, []))
+            iprange = addr.get('iprange', '')
+            start_ip = ''
+            end_ip = ''
+            if iprange:
+                parts = iprange.split()
+                start_ip = parts[0] if len(parts) > 0 else ''
+                end_ip = parts[1] if len(parts) > 1 else ''
+
+            addresses_data.append({
+                'name': name,
+                'type': addr.get('type', ''),
+                'subnet': addr.get('subnet', ''),
+                'start-ip': start_ip,
+                'end-ip': end_ip,
+                'fqdn': addr.get('fqdn', ''),
+                'comment': addr.get('comment', addr.get('comments', '')),
+                'member-of': ' '.join(groups),
             })
 
-        self.dataframes['Адреса_и_группы'] = pd.DataFrame(data)
-        print(f"   Найдено: {len(data)}")
+        groups_data = []
+        for group in addr_groups:
+            groups_data.append({
+                'name': group.get('_name', ''),
+                'type': group.get('type', ''),
+                'member': group.get('member', ''),
+                'comment': group.get('comment', group.get('comments', '')),
+            })
+
+        self.dataframes['Адреса'] = pd.DataFrame(addresses_data)
+        self.dataframes['Группы_адресов'] = pd.DataFrame(groups_data)
+        print(f"   Адресов: {len(addresses_data)}, групп адресов: {len(groups_data)}")
 
     def parse_vpn_users(self):
         """Парсит VPN пользователей"""
@@ -484,7 +637,8 @@ class FortigateConfigParser:
                 'IPSec_Туннели',
                 'Статические_маршруты',
                 'NAT_правила',
-                'Адреса_и_группы',
+                'Адреса',
+                'Группы_адресов',
                 'VPN_Пользователи'
             ]
 
@@ -563,7 +717,8 @@ def main():
     print("  • IPSec_Туннели - Туннели site-to-site")
     print("  • Статические_маршруты - Таблица маршрутизации")
     print("  • NAT_правила - Правила преобразования адресов")
-    print("  • Адреса_и_группы - Объекты адресов")
+    print("  • Адреса - Объекты firewall address")
+    print("  • Группы_адресов - Объекты firewall addrgrp")
     print("  • VPN_Пользователи - Доступ по VPN")
     print("\nОткройте файл в Excel или LibreOffice Calc.")
 
