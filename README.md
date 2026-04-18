@@ -16,10 +16,10 @@
 - адреса и группы адресов;
 - VPN пользователи.
 
-## Скачать готовые сборки
+## Скачать готовую версию (установщики)
 
-- Windows (`.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer.exe
-- macOS (`.app` в zip): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.zip
+- Windows Installer (`Setup.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-Setup.exe
+- macOS Installer (`.pkg`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.pkg
 
 ## Быстрый старт (Python)
 
@@ -42,6 +42,10 @@
 2. `pyinstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.exe`
+4. Установщик (Inno Setup):
+   - установи Inno Setup 6
+   - запусти `build_installer.bat`
+   - получишь `dist/FortiGateAnalyzer-Setup.exe`
 
 ### macOS
 
@@ -49,6 +53,8 @@
 2. `pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.app`
+4. Установщик macOS:
+   - `productbuild --component dist/FortiGateAnalyzer.app /Applications dist/FortiGateAnalyzer-macOS.pkg`
 
 ## Тесты (ветка dev)
 
