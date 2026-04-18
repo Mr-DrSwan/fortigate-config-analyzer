@@ -28,6 +28,7 @@ FORTIGATE_COLOR_OPTIONS = ["(из конфига)"] + [str(i) for i in range(0, 
 GITHUB_OWNER = "Mr-DrSwan"
 GITHUB_REPO = "fortigate-config-analyzer"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+COPYRIGHT_TEXT = f"© {GITHUB_OWNER} (GitHub)"
 
 
 def analyze_config(input_path: Path, output_path: Path) -> FortigateConfigParser:
@@ -69,10 +70,10 @@ class App:
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Выберите файл конфигурации FortiGate (.conf).")
+        self.local_version = get_local_version()
 
         self.last_parser: Optional[FortigateConfigParser] = None
         self._build_ui()
-        self.local_version = get_local_version()
 
     def _set_window_icon(self) -> None:
         icon_path = Path(__file__).resolve().parent / "assets" / "forti-analyzer-icon.png"
@@ -115,6 +116,12 @@ class App:
         tk.Button(frame, text="Проверка обновлений", command=self.check_for_updates, height=1).grid(
             row=6, column=0, columnspan=2, sticky="we", pady=(8, 0)
         )
+        tk.Label(
+            frame,
+            text=f"Версия {self.local_version} | {COPYRIGHT_TEXT}",
+            anchor="center",
+            fg="#5E6B8A",
+        ).grid(row=7, column=0, columnspan=2, sticky="we", pady=(10, 0))
         frame.columnconfigure(0, weight=1)
 
     def select_input(self) -> None:
