@@ -23,12 +23,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --no-progress -y
+
       - name: Build EXE
         run: |
           pyinstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py
+
+      - name: Build installer
+        run: |
+          iscc installer\FortiGateAnalyzer.iss
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FortiGateAnalyzer-windows
-          path: dist/FortiGateAnalyzer.exe
+          path: |
+            dist/FortiGateAnalyzer.exe
+            dist/FortiGateAnalyzer-Setup.exe

@@ -19,6 +19,7 @@
 ## Скачать готовые сборки
 
 - Windows (`.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer.exe
+- Windows Installer (`Setup.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-Setup.exe
 - macOS (`.app` в zip): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.zip
 
 ## Быстрый старт (Python)
@@ -42,6 +43,10 @@
 2. `pyinstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.exe`
+4. Установщик (Inno Setup):
+   - установи Inno Setup 6
+   - запусти `build_installer.bat`
+   - получишь `dist/FortiGateAnalyzer-Setup.exe`
 
 ### macOS
 
