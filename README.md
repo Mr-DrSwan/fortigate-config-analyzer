@@ -16,11 +16,10 @@
 - адреса и группы адресов;
 - VPN пользователи.
 
-## Скачать готовые сборки
+## Скачать готовую версию (установщики)
 
-- Windows (`.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer.exe
 - Windows Installer (`Setup.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-Setup.exe
-- macOS (`.app` в zip): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.zip
+- macOS Installer (`.pkg`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.pkg
 
 ## Быстрый старт (Python)
 
@@ -54,6 +53,8 @@
 2. `pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py`
 3. Готовый файл:
    - `dist/FortiGateAnalyzer.app`
+4. Установщик macOS:
+   - `productbuild --component dist/FortiGateAnalyzer.app /Applications dist/FortiGateAnalyzer-macOS.pkg`
 
 ## Тесты (ветка dev)
 

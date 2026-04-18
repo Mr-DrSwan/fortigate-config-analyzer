@@ -27,12 +27,12 @@ jobs:
         run: |
           pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py
 
-      - name: Create zip archive
+      - name: Build installer package
         run: |
-          ditto -c -k --sequesterRsrc --keepParent dist/FortiGateAnalyzer.app dist/FortiGateAnalyzer-macOS.zip
+          productbuild --component dist/FortiGateAnalyzer.app /Applications dist/FortiGateAnalyzer-macOS.pkg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FortiGateAnalyzer-macOS
-          path: dist/FortiGateAnalyzer-macOS.zip
+          path: dist/FortiGateAnalyzer-macOS.pkg

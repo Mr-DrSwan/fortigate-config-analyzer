@@ -52,12 +52,12 @@ jobs:
       - name: Build app bundle
         run: |
           pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py
-          ditto -c -k --sequesterRsrc --keepParent dist/FortiGateAnalyzer.app dist/FortiGateAnalyzer-macOS.zip
+          productbuild --component dist/FortiGateAnalyzer.app /Applications dist/FortiGateAnalyzer-macOS.pkg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FortiGateAnalyzer-macOS-release
-          path: dist/FortiGateAnalyzer-macOS.zip
+          path: dist/FortiGateAnalyzer-macOS.pkg
 
   release:
     runs-on: ubuntu-latest
@@ -81,4 +81,4 @@ jobs:
           files: |
             release_assets/FortiGateAnalyzer.exe
             release_assets/FortiGateAnalyzer-Setup.exe
-            release_assets/FortiGateAnalyzer-macOS.zip
+            release_assets/FortiGateAnalyzer-macOS.pkg

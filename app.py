@@ -1,9 +1,17 @@
 import argparse
+import json
+import os
 from pathlib import Path
+import platform
+import subprocess
+import tempfile
+import threading
 from typing import Dict, List, Optional, Set
 import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog, messagebox
+from urllib.error import URLError
+from urllib.request import urlopen, urlretrieve
 
 from fortigate_analyzer import FortigateConfigParser
 
@@ -17,6 +25,9 @@ config firewall addrgrp
 end"""
 
 FORTIGATE_COLOR_OPTIONS = ["(из конфига)"] + [str(i) for i in range(0, 33)]
+GITHUB_OWNER = "Mr-DrSwan"
+GITHUB_REPO = "fortigate-config-analyzer"
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
 
 
 def analyze_config(input_path: Path, output_path: Path) -> FortigateConfigParser:
@@ -24,6 +35,27 @@ def analyze_config(input_path: Path, output_path: Path) -> FortigateConfigParser
     parser.parse_all()
     parser.save_to_excel(str(output_path))
     return parser
+
+
+def get_local_version() -> str:
+    if VERSION_FILE.exists():
+        return VERSION_FILE.read_text(encoding="utf-8").strip()
+    return "0.0.0"
+
+
+def parse_version(version: str) -> tuple:
+    cleaned = version.strip().lstrip("v")
+    parts = []
+    for token in cleaned.split("."):
+        digits = "".join(ch for ch in token if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def is_newer_version(remote_version: str, local_version: str) -> bool:
+    return parse_version(remote_version) > parse_version(local_version)
 
 
 class App:
@@ -40,6 +72,7 @@ class App:
 
         self.last_parser: Optional[FortigateConfigParser] = None
         self._build_ui()
+        self.local_version = get_local_version()
 
     def _set_window_icon(self) -> None:
         icon_path = Path(__file__).resolve().parent / "assets" / "forti-analyzer-icon.png"
@@ -78,6 +111,9 @@ class App:
 
         tk.Label(frame, textvariable=self.status_var, anchor="w", justify="left", fg="#2E3A59").grid(
             row=5, column=0, columnspan=2, sticky="we"
+        )
+        tk.Button(frame, text="Проверка обновлений", command=self.check_for_updates, height=1).grid(
+            row=6, column=0, columnspan=2, sticky="we", pady=(8, 0)
         )
         frame.columnconfigure(0, weight=1)
 
@@ -458,6 +494,134 @@ class App:
 
         tk.Button(actions, text="Скопировать", command=copy_commands, width=16).pack(side="right")
         tk.Button(actions, text="Закрыть", command=dialog.destroy, width=16).pack(side="right", padx=(0, 8))
+
+    def _ask_update_decision(self, remote_version: str) -> bool:
+        decision = {"update": False}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Доступно обновление")
+        dialog.geometry("460x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text=(
+                f"Найдена новая версия: {remote_version}\n"
+                f"Текущая версия: {self.local_version}\n\n"
+                "Установить обновление сейчас?"
+            ),
+            justify="left",
+            anchor="w",
+        ).pack(fill="both", expand=True, padx=14, pady=14)
+
+        actions = tk.Frame(dialog)
+        actions.pack(fill="x", padx=14, pady=(0, 12))
+
+        def do_update() -> None:
+            decision["update"] = True
+            dialog.destroy()
+
+        tk.Button(actions, text="Обновить", width=14, command=do_update).pack(side="right")
+        tk.Button(actions, text="Позже", width=14, command=dialog.destroy).pack(side="right", padx=(0, 8))
+
+        self.root.wait_window(dialog)
+        return decision["update"]
+
+    def _fetch_remote_version(self) -> str:
+        url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/VERSION"
+        with urlopen(url, timeout=15) as resp:
+            return resp.read().decode("utf-8").strip()
+
+    def _get_platform_asset_name(self) -> str:
+        system = platform.system().lower()
+        if system == "windows":
+            return "FortiGateAnalyzer-Setup.exe"
+        if system == "darwin":
+            return "FortiGateAnalyzer-macOS.pkg"
+        raise RuntimeError(f"Платформа не поддерживается автообновлением: {platform.system()}")
+
+    def _fetch_latest_asset_url(self, asset_name: str) -> str:
+        api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+        with urlopen(api_url, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        for asset in payload.get("assets", []):
+            if asset.get("name") == asset_name:
+                return asset.get("browser_download_url", "")
+        raise RuntimeError(f"В релизе не найден файл: {asset_name}")
+
+    def _download_update_asset(self, url: str, filename: str) -> Path:
+        temp_dir = Path(tempfile.mkdtemp(prefix="forti-update-"))
+        target = temp_dir / filename
+        urlretrieve(url, target)
+        return target
+
+    def _run_installer_and_restart(self, installer_path: Path) -> None:
+        system = platform.system().lower()
+        if system == "windows":
+            subprocess.Popen(
+                [
+                    str(installer_path),
+                    "/CLOSEAPPLICATIONS",
+                    "/RESTARTAPPLICATIONS",
+                ],
+                shell=False,
+            )
+            self.root.after(200, self.root.destroy)
+            return
+
+        if system == "darwin":
+            # For macOS installer we open .pkg and schedule app relaunch.
+            subprocess.Popen(["open", str(installer_path)])
+            subprocess.Popen(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "sleep 5; open -a FortiGateAnalyzer",
+                ],
+                start_new_session=True,
+            )
+            self.root.after(200, self.root.destroy)
+            return
+
+        raise RuntimeError(f"Платформа не поддерживается автообновлением: {platform.system()}")
+
+    def check_for_updates(self) -> None:
+        self.status_var.set("Проверка обновлений...")
+
+        def worker() -> None:
+            try:
+                remote_version = self._fetch_remote_version()
+            except (URLError, TimeoutError, OSError) as exc:
+                self.root.after(0, lambda: self.status_var.set(f"Не удалось проверить обновления: {exc}"))
+                return
+            except Exception as exc:
+                self.root.after(0, lambda: self.status_var.set(f"Ошибка проверки обновлений: {exc}"))
+                return
+
+            if not is_newer_version(remote_version, self.local_version):
+                self.root.after(0, lambda: self.status_var.set(f"Обновлений нет. Версия {self.local_version} актуальна."))
+                return
+
+            def on_found_update() -> None:
+                should_update = self._ask_update_decision(remote_version)
+                if not should_update:
+                    self.status_var.set("Обновление отложено.")
+                    return
+
+                try:
+                    asset_name = self._get_platform_asset_name()
+                    asset_url = self._fetch_latest_asset_url(asset_name)
+                    self.status_var.set(f"Скачивание обновления {remote_version}...")
+                    installer = self._download_update_asset(asset_url, asset_name)
+                    self.status_var.set("Запуск установщика обновления...")
+                    self._run_installer_and_restart(installer)
+                except Exception as exc:
+                    self.status_var.set(f"Не удалось установить обновление: {exc}")
+                    messagebox.showerror("Обновление", str(exc))
+
+            self.root.after(0, on_found_update)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def parse_args() -> argparse.Namespace:
