@@ -13,6 +13,7 @@ FortiGate Config Parser - Чистый и рабочий
 
 import pandas as pd
 import re
+import ipaddress
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
 import sys
@@ -27,6 +28,7 @@ class FortigateConfigParser:
         self.address_objects: Dict[str, Dict[str, str]] = {}
         self.address_group_objects: Dict[str, Dict[str, str]] = {}
         self.address_group_members: Dict[str, List[str]] = {}
+        self.address_entries: List[Dict[str, str]] = []
 
         # Словарь переводов полей firewall
         self.firewall_translations = {
@@ -253,11 +255,13 @@ class FortigateConfigParser:
             return self._quote(value)
         return value
 
-    def _build_address_command_block(self, name: str) -> List[str]:
-        obj = self.address_objects.get(name, {})
+    def _build_address_command_block(self, name: str, color_override: Optional[int] = None) -> List[str]:
+        obj = dict(self.address_objects.get(name, {}))
+        if color_override is not None:
+            obj["color"] = str(color_override)
         lines = [f'    edit {self._quote(name)}']
         for key, value in obj.items():
-            if key in {"_name", "uuid"}:
+            if key in {"_name", "uuid", "associated-interface"}:
                 continue
             if value == "":
                 continue
@@ -279,15 +283,127 @@ class FortigateConfigParser:
         lines.append("    next")
         return lines
 
+    @staticmethod
+    def _normalize_whitespace(value: str) -> str:
+        return " ".join(value.split())
+
+    def _extract_address_value_signature(self, obj: Dict[str, str]) -> tuple[str, str]:
+        fqdn = self._normalize_whitespace(obj.get("fqdn", ""))
+        if fqdn:
+            return "fqdn", fqdn.lower()
+
+        iprange = self._normalize_whitespace(obj.get("iprange", ""))
+        if iprange:
+            return "iprange", iprange
+
+        subnet = self._normalize_whitespace(obj.get("subnet", ""))
+        if subnet:
+            parts = subnet.split()
+            if len(parts) == 2:
+                try:
+                    network = ipaddress.IPv4Network((parts[0], parts[1]), strict=False)
+                    return "subnet", f"{network.network_address}/{network.prefixlen}"
+                except ValueError:
+                    pass
+            return "subnet", subnet
+
+        wildcard = self._normalize_whitespace(obj.get("wildcard", ""))
+        if wildcard:
+            return "wildcard", wildcard
+
+        start_ip = self._normalize_whitespace(obj.get("start-ip", ""))
+        end_ip = self._normalize_whitespace(obj.get("end-ip", ""))
+        if start_ip or end_ip:
+            return "range", f"{start_ip}-{end_ip}"
+
+        relevant_items = []
+        for key in sorted(obj):
+            if key in {"_name", "uuid", "comment", "comments", "color", "associated-interface"}:
+                continue
+            value = self._normalize_whitespace(obj.get(key, ""))
+            if value:
+                relevant_items.append(f"{key}={value}")
+        return "other", ";".join(relevant_items)
+
+    def find_duplicate_addresses(self) -> Dict[str, object]:
+        """Find duplicates inside firewall address config section."""
+        entries = self.address_entries
+        if not entries:
+            entries = self._extract_blocks("firewall address")
+            self.address_entries = entries
+
+        by_value: Dict[tuple[str, str], List[str]] = {}
+        by_name: Dict[str, List[Dict[str, str]]] = {}
+        exact_records: Dict[tuple[str, str], int] = {}
+
+        for obj in entries:
+            name = obj.get("_name", "").strip()
+            if not name:
+                continue
+            value_sig = self._extract_address_value_signature(obj)
+            by_value.setdefault(value_sig, []).append(name)
+            by_name.setdefault(name, []).append(obj)
+
+            payload_items = []
+            for key in sorted(obj):
+                if key in {"uuid"}:
+                    continue
+                payload_items.append(f"{key}={self._normalize_whitespace(str(obj.get(key, '')))}")
+            record_key = (name, "|".join(payload_items))
+            exact_records[record_key] = exact_records.get(record_key, 0) + 1
+
+        same_value_different_names: List[Dict[str, object]] = []
+        for (value_type, value), names in by_value.items():
+            unique_names = sorted(set(names))
+            if len(unique_names) > 1:
+                same_value_different_names.append(
+                    {
+                        "value_type": value_type,
+                        "value": value,
+                        "names": unique_names,
+                    }
+                )
+
+        same_name_multiple_entries: List[Dict[str, object]] = []
+        for name, objs in by_name.items():
+            if len(objs) <= 1:
+                continue
+            signatures = sorted({self._extract_address_value_signature(obj)[1] for obj in objs})
+            same_name_multiple_entries.append(
+                {
+                    "name": name,
+                    "count": len(objs),
+                    "values": signatures,
+                }
+            )
+
+        exact_duplicate_entries: List[Dict[str, object]] = []
+        for (name, payload), count in exact_records.items():
+            if count > 1:
+                exact_duplicate_entries.append({"name": name, "count": count})
+
+        same_value_different_names.sort(key=lambda item: (str(item["value"]), ",".join(item["names"])))
+        same_name_multiple_entries.sort(key=lambda item: str(item["name"]).lower())
+        exact_duplicate_entries.sort(key=lambda item: str(item["name"]).lower())
+
+        return {
+            "total_entries": len([obj for obj in entries if obj.get("_name", "").strip()]),
+            "same_value_different_names": same_value_different_names,
+            "same_name_multiple_entries": same_name_multiple_entries,
+            "exact_duplicate_entries": exact_duplicate_entries,
+        }
+
     def build_transfer_plan(
         self,
         selected_addresses: Set[str],
         selected_groups: Set[str],
         existing_names: Set[str],
         group_color_overrides: Optional[Dict[str, int]] = None,
+        address_color_overrides: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         """Build transfer command plan while skipping duplicates on target."""
         group_color_overrides = group_color_overrides or {}
+        address_color_overrides = address_color_overrides or {}
         expanded_group_members: Set[str] = set()
         for group_name in selected_groups:
             expanded_group_members.update(self.address_group_members.get(group_name, []))
@@ -303,7 +419,21 @@ class FortigateConfigParser:
         if addresses_to_create:
             command_lines.append("config firewall address")
             for name in addresses_to_create:
-                command_lines.extend(self._build_address_command_block(name))
+                command_lines.extend(self._build_address_command_block(name, address_color_overrides.get(name)))
+            command_lines.append("end")
+            command_lines.append("")
+
+        # If address already exists on target, still allow explicit color update when user provided override.
+        existing_addresses_to_recolor = sorted(
+            name for name in duplicate_addresses if name in address_color_overrides
+        )
+        if existing_addresses_to_recolor:
+            command_lines.append("# Обновление цвета существующих адресов")
+            command_lines.append("config firewall address")
+            for name in existing_addresses_to_recolor:
+                command_lines.append(f'    edit {self._quote(name)}')
+                command_lines.append(f"        set color {address_color_overrides[name]}")
+                command_lines.append("    next")
             command_lines.append("end")
             command_lines.append("")
 
@@ -519,6 +649,7 @@ class FortigateConfigParser:
         """Парсит адреса и группы адресов в отдельные таблицы"""
         print("📍 Парсинг адресов...")
         addresses = self._extract_blocks('firewall address')
+        self.address_entries = addresses
         addr_groups = self._extract_blocks('firewall addrgrp')
         self.address_objects = {addr.get("_name", ""): addr for addr in addresses if addr.get("_name")}
         self.address_group_objects = {grp.get("_name", ""): grp for grp in addr_groups if grp.get("_name")}
