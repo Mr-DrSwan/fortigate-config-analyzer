@@ -12,10 +12,10 @@ FortiGate Config Parser - Чистый и рабочий
 """
 
 import pandas as pd
-import re
 import ipaddress
+import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 import sys
 import os
 
@@ -24,11 +24,15 @@ class FortigateConfigParser:
     def __init__(self, config_file: str):
         self.config_file = config_file
         self.config_data = self._read_config()
+        self._lines = self.config_data.splitlines()
+        self._section_ranges = self._build_section_ranges()
         self.dataframes = {}
         self.address_objects: Dict[str, Dict[str, str]] = {}
         self.address_group_objects: Dict[str, Dict[str, str]] = {}
         self.address_group_members: Dict[str, List[str]] = {}
         self.address_entries: List[Dict[str, str]] = []
+        self._user_group_blocks: Optional[List[Dict[str, str]]] = None
+        self.profile: Dict[str, float] = {}
 
         # Словарь переводов полей firewall
         self.firewall_translations = {
@@ -143,76 +147,99 @@ class FortigateConfigParser:
             print(f"❌ Ошибка чтения файла: {e}")
             sys.exit(1)
 
-    def _extract_blocks(self, block_name: str) -> List[Dict]:
-        """Извлекает все edit/next блоки из нужного config-раздела."""
-        target = f"config {block_name}".lower()
-        lines = self.config_data.splitlines()
-        all_blocks: List[Dict] = []
-
-        in_target = False
-        config_depth = 0
-        current_block: Dict | None = None
-
-        for raw_line in lines:
+    def _build_section_ranges(self) -> Dict[str, List[Tuple[int, int]]]:
+        ranges: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        depth = 0
+        current_name: Optional[str] = None
+        current_start = -1
+        for idx, raw_line in enumerate(self._lines):
             line = raw_line.strip()
             if not line:
                 continue
-
             lower = line.lower()
-
-            if not in_target:
-                if lower == target:
-                    in_target = True
-                    config_depth = 1
-                continue
-
-            # Track nested config/end to stay inside the exact target section.
             if lower.startswith("config "):
-                config_depth += 1
+                if depth == 0:
+                    current_name = lower[len("config "):].strip()
+                    current_start = idx + 1
+                depth += 1
                 continue
+            if lower == "end" and depth > 0:
+                depth -= 1
+                if depth == 0 and current_name is not None and current_start >= 0:
+                    ranges[current_name].append((current_start, idx))
+                    current_name = None
+                    current_start = -1
+        return ranges
 
-            if lower == "end":
-                config_depth -= 1
-                if config_depth == 0:
+    @staticmethod
+    def _parse_set_value(raw_value: str) -> str:
+        value = raw_value.strip()
+        if '"' not in value:
+            if value.startswith('"') and value.endswith('"'):
+                return value[1:-1]
+            return value
+        extracted: List[str] = []
+        in_quotes = False
+        current: List[str] = []
+        for char in value:
+            if char == '"':
+                if in_quotes:
+                    extracted.append("".join(current))
+                    current = []
+                    in_quotes = False
+                else:
+                    in_quotes = True
+                continue
+            if in_quotes:
+                current.append(char)
+        if extracted:
+            return " ".join(extracted)
+        return value
+
+    def _extract_blocks(self, block_name: str) -> List[Dict]:
+        """Извлекает все edit/next блоки из нужного config-раздела."""
+        target = block_name.lower().strip()
+        ranges = self._section_ranges.get(target, [])
+        all_blocks: List[Dict] = []
+        for start_idx, end_idx in ranges:
+            config_depth = 1
+            current_block: Optional[Dict[str, str]] = None
+            for raw_line in self._lines[start_idx:end_idx]:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                lower = line.lower()
+                if lower.startswith("config "):
+                    config_depth += 1
+                    continue
+                if lower == "end":
+                    if config_depth > 1:
+                        config_depth -= 1
+                    continue
+                if config_depth != 1:
+                    continue
+                if lower.startswith("edit "):
+                    if current_block is not None:
+                        all_blocks.append(current_block)
+                    edit_value = line[5:].strip()
+                    if edit_value.startswith('"') and edit_value.endswith('"'):
+                        edit_value = edit_value[1:-1]
+                    current_block = {"_name": edit_value}
+                    continue
+                if lower == "next":
                     if current_block is not None:
                         all_blocks.append(current_block)
                         current_block = None
-                    in_target = False
-                continue
-
-            # Parse edit/next/set only on top level of this config section.
-            if config_depth != 1:
-                continue
-
-            if lower.startswith("edit "):
-                if current_block is not None:
-                    all_blocks.append(current_block)
-                edit_value = line[5:].strip()
-                if edit_value.startswith('"') and edit_value.endswith('"'):
-                    edit_value = edit_value[1:-1]
-                current_block = {"_name": edit_value}
-                continue
-
-            if lower == "next":
-                if current_block is not None:
-                    all_blocks.append(current_block)
-                    current_block = None
-                continue
-
-            if lower.startswith("set ") and current_block is not None:
-                parts = line.split(maxsplit=2)
-                if len(parts) < 2:
                     continue
-                param = parts[1]
-                value = parts[2].strip() if len(parts) > 2 else ""
-
-                quoted_values = re.findall(r'"([^"]*)"', value)
-                if quoted_values:
-                    value = " ".join(quoted_values)
-                elif value.startswith('"') and value.endswith('"'):
-                    value = value[1:-1]
-
-                current_block[param] = value
+                if lower.startswith("set ") and current_block is not None:
+                    parts = line.split(maxsplit=2)
+                    if len(parts) < 2:
+                        continue
+                    param = parts[1]
+                    raw_value = parts[2] if len(parts) > 2 else ""
+                    current_block[param] = self._parse_set_value(raw_value)
+            if current_block is not None:
+                all_blocks.append(current_block)
 
         return all_blocks
 
@@ -482,6 +509,7 @@ class FortigateConfigParser:
         """Парсит группы пользователей"""
         print("👥 Парсинг групп пользователей...")
         groups = self._extract_blocks('user group')
+        self._user_group_blocks = groups
 
         data = []
         for idx, group in enumerate(groups, 1):
@@ -506,25 +534,17 @@ class FortigateConfigParser:
             print("   Не найдено")
             return
 
-        # Собираем ВСЕ уникальные поля из всех правил
-        all_fields = set()
-        for rule in rules:
-            all_fields.update(rule.keys())
-
-        # Преобразуем в список и сортируем
-        all_fields = sorted(all_fields)
-
         data = []
+        all_fields: Set[str] = set()
         for idx, rule in enumerate(rules, 1):
             row = {'№': idx}
-
-            # Проходим по всем возможным полям
-            for field in all_fields:
+            for field, raw_value in rule.items():
+                all_fields.add(field)
                 # Переводим имя поля
                 russian_field = self.firewall_translations.get(field, field)
 
                 # Получаем значение
-                value = rule.get(field, '')
+                value = raw_value
 
                 # Специальная обработка для некоторых полей
                 if field == 'action':
@@ -718,7 +738,7 @@ class FortigateConfigParser:
             })
 
         # Группы для VPN
-        vpn_groups = self._extract_blocks('user group')
+        vpn_groups = self._user_group_blocks if self._user_group_blocks is not None else self._extract_blocks('user group')
         start_idx = len(data) + 1
         for idx, group in enumerate(vpn_groups, start_idx):
             if 'vpn' in group.get('_name', '').lower() or 'ssl' in group.get('_name', '').lower():
@@ -740,16 +760,36 @@ class FortigateConfigParser:
         print("🚀 НАЧИНАЮ ПАРСИНГ КОНФИГУРАЦИИ FORTIGATE")
         print("=" * 70)
 
-        self.parse_local_users()
-        self.parse_user_groups()
-        self.parse_firewall_rules()
-        self.parse_ipsec_tunnels()
-        self.parse_static_routes()
-        self.parse_nat_rules()
-        self.parse_addresses()
-        self.parse_vpn_users()
+        self.profile = {}
+
+        def run_step(step_name: str, callback: Callable[[], None]) -> None:
+            started = time.perf_counter()
+            callback()
+            self.profile[step_name] = time.perf_counter() - started
+
+        run_step("parse_local_users", self.parse_local_users)
+        run_step("parse_user_groups", self.parse_user_groups)
+        run_step("parse_firewall_rules", self.parse_firewall_rules)
+        run_step("parse_ipsec_tunnels", self.parse_ipsec_tunnels)
+        run_step("parse_static_routes", self.parse_static_routes)
+        run_step("parse_nat_rules", self.parse_nat_rules)
+        run_step("parse_addresses", self.parse_addresses)
+        run_step("parse_vpn_users", self.parse_vpn_users)
 
         print("\n✅ ПАРСИНГ ЗАВЕРШЕН!")
+
+    def parse_addresses_only(self) -> None:
+        started = time.perf_counter()
+        self.parse_addresses()
+        self.profile = {"parse_addresses_only": time.perf_counter() - started}
+
+    @staticmethod
+    def _sanitize_spreadsheet_cell(value):
+        if not isinstance(value, str):
+            return value
+        if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + value
+        return value
 
     def save_to_excel(self, filename: str = "fortigate_analysis.xlsx"):
         """Сохраняет все данные в Excel файл"""
@@ -777,15 +817,20 @@ class FortigateConfigParser:
                 if sheet_name in self.dataframes:
                     df = self.dataframes[sheet_name]
                     if not df.empty:
+                        sanitized_df = df.copy()
+                        for col_name in sanitized_df.columns:
+                            if sanitized_df[col_name].dtype == object:
+                                sanitized_df[col_name] = sanitized_df[col_name].map(self._sanitize_spreadsheet_cell)
                         # Сохраняем в Excel
-                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        sanitized_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
                         # Настраиваем ширину столбцов
                         worksheet = writer.sheets[sheet_name]
+                        max_rows_for_width = min(200, worksheet.max_row)
                         for column in worksheet.columns:
                             max_length = 0
                             column_letter = column[0].column_letter
-                            for cell in column:
+                            for cell in column[:max_rows_for_width]:
                                 try:
                                     cell_length = len(str(cell.value))
                                     if cell_length > max_length:
@@ -806,6 +851,22 @@ class FortigateConfigParser:
             total += count
             print(f"  {sheet_name:25} - {count} записей")
         print(f"\n  📈 ВСЕГО ЗАПИСЕЙ: {total}")
+
+    def render_address_config_lines(self, names: Optional[List[str]] = None) -> List[str]:
+        target_names = names if names is not None else sorted(self.address_objects.keys(), key=str.lower)
+        lines: List[str] = ["config firewall address"]
+        for name in target_names:
+            lines.extend(self._build_address_command_block(name))
+        lines.append("end")
+        return lines
+
+    def render_addrgrp_config_lines(self, names: Optional[List[str]] = None) -> List[str]:
+        target_names = names if names is not None else sorted(self.address_group_objects.keys(), key=str.lower)
+        lines: List[str] = ["config firewall addrgrp"]
+        for name in target_names:
+            lines.extend(self._build_addrgrp_command_block(name))
+        lines.append("end")
+        return lines
 
 
 def main():

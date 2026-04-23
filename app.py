@@ -1,5 +1,4 @@
 import argparse
-import ipaddress
 import json
 import os
 import platform
@@ -9,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,9 +17,21 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.error import URLError
-from urllib.request import urlopen, urlretrieve
+from urllib.request import urlopen
 
+from address_utils import (
+    address_sort_key,
+    address_sort_mode_key,
+    extract_first_ipv4,
+    get_address_display_value,
+    normalize_iprange_value,
+    normalize_subnet_value,
+    subnet_to_display,
+)
+from config_sections import replace_or_append_config_section
 from fortigate_analyzer import FortigateConfigParser
+from perf_metrics import PerfRecorder
+from security_utils import ensure_under_root, parse_sha256_file, sanitize_spreadsheet_text, sha256_file
 
 
 CHECK_COMMAND_TEXT = """config firewall address
@@ -377,6 +389,7 @@ class App:
         self.devices: Dict[str, DeviceRecord] = {}
         self.selected_device_name: Optional[str] = None
         self.last_parser: Optional[FortigateConfigParser] = None
+        self._parser_cache: Dict[Tuple[str, float, str], FortigateConfigParser] = {}
         self.details_vars: Dict[str, tk.StringVar] = {}
         self.hosts_canvas: Optional[tk.Canvas] = None
         self.hosts_frame: Optional[tk.Frame] = None
@@ -409,6 +422,7 @@ class App:
         self._scroll_fallback_targets: Dict[str, tk.Canvas] = {}
         self._active_scroll_canvas: Optional[tk.Canvas] = None
         self._global_wheel_bound = False
+        self.perf_recorder = PerfRecorder(APP_DATA_DIR / "perf_metrics.jsonl")
         self.ui_root: tk.Widget = self.root
         # Use native OS title bar to keep window controls reliable.
         self.show_custom_titlebar = False
@@ -960,6 +974,7 @@ class App:
         return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     def _open_device_page(self, device_name: str) -> None:
+        started_at = time.perf_counter()
         record = self.devices.get(device_name)
         if record is None:
             return
@@ -983,6 +998,7 @@ class App:
         self.device_page_excel_var.set(record.excel_path.name if record.excel_path else "-")
         self.device_page_csv_var.set(record.csv_path.name if record.csv_path else "-")
         self.device_page_folder_var.set(str(record.folder))
+        self._record_perf("ui.open_device_page", started_at, device=device_name)
 
     def _open_selected_device_page(self) -> None:
         record = self._get_selected_device()
@@ -997,7 +1013,7 @@ class App:
         self._open_device_editor(record.name)
 
     def _show_addresses_for_selected_device(self) -> None:
-        parser = self._load_parser_for_selected_device()
+        parser = self._load_parser_for_selected_device(profile="addresses")
         if parser is None:
             return
         self.last_parser = parser
@@ -1046,7 +1062,7 @@ class App:
         self._create_round_button(actions, "Закрыть", dialog.destroy, style_kind="ghost").pack(side="right")
 
     def _open_group_sorting_for_selected_device(self) -> None:
-        parser = self._load_parser_for_selected_device()
+        parser = self._load_parser_for_selected_device(profile="addresses")
         if parser is None:
             return
         self.last_parser = parser
@@ -1309,7 +1325,7 @@ class App:
         self._create_round_button(actions, "Отмена", dialog.destroy, style_kind="ghost").pack(side="right", padx=(0, 8))
 
     def _show_address_duplicates_for_selected_device(self) -> None:
-        parser = self._load_parser_for_selected_device()
+        parser = self._load_parser_for_selected_device(profile="addresses")
         if parser is None:
             return
         self.last_parser = parser
@@ -1361,6 +1377,7 @@ class App:
         chooser_scroll_canvas.configure(yscrollcommand=chooser_scroll.set)
         chooser_scroll_canvas.pack(side="left", fill="both", expand=True)
         chooser_scroll.pack(side="right", fill="y")
+        self._bind_vertical_mousewheel(chooser_scroll_canvas, chooser_scroll_canvas, chooser_frame, chooser_wrap)
 
         keep_vars: List[Tuple[List[str], tk.StringVar, tk.StringVar, str]] = []
         if same_value:
@@ -1813,6 +1830,7 @@ class App:
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        self._bind_vertical_mousewheel(canvas, canvas, frame, cards_wrap)
         self.cards_canvas = canvas
         self.cards_frame = frame
 
@@ -2397,16 +2415,26 @@ class App:
 
     def _load_devices(self) -> None:
         records: Dict[str, DeviceRecord] = {}
+        vault_root = DEVICES_DIR.resolve()
         for folder in sorted(DEVICES_DIR.iterdir()):
             if not folder.is_dir():
+                continue
+            if folder.is_symlink():
+                continue
+            try:
+                resolved_folder = ensure_under_root(folder, vault_root, must_exist=True)
+            except ValueError:
                 continue
             config_files = sorted(folder.glob("*.conf")) + sorted(folder.glob("*.txt"))
             excel_files = sorted(folder.glob("*.xlsx"))
             csv_files = sorted(folder.glob("*.csv"))
+            config_files = [path for path in config_files if self._is_device_vault_path(path)]
+            excel_files = [path for path in excel_files if self._is_device_vault_path(path)]
+            csv_files = [path for path in csv_files if self._is_device_vault_path(path)]
             mtime = datetime.fromtimestamp(folder.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
             records[folder.name] = DeviceRecord(
                 name=folder.name,
-                folder=folder,
+                folder=resolved_folder,
                 config_path=config_files[0] if config_files else None,
                 excel_path=excel_files[0] if excel_files else None,
                 csv_path=csv_files[0] if csv_files else None,
@@ -2440,6 +2468,8 @@ class App:
                     font=UI_FONTS["label_lg"],
                 ).pack(anchor="w", padx=UI_SPACING["section"], pady=UI_SPACING["section"])
             else:
+                self.cards_frame.grid_columnconfigure(0, weight=1)
+                self.cards_frame.grid_columnconfigure(1, weight=1)
                 for index, record in enumerate(self.devices.values()):
                     is_selected = record.name == self.selected_device_name
                     card_canvas, card = self._create_rounded_container(
@@ -2459,8 +2489,6 @@ class App:
                         pady=UI_SPACING["gap"],
                     )
                     self.card_canvases[record.name] = card_canvas
-                    self.cards_frame.grid_columnconfigure(0, weight=1)
-                    self.cards_frame.grid_columnconfigure(1, weight=1)
 
                     top = tk.Frame(card, bg=UI_COLORS["panel"])
                     top.pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["tight"]))
@@ -2532,7 +2560,7 @@ class App:
                         widget.bind("<Leave>", lambda _event, n=record.name, s=is_selected: self._set_card_hover(n, s, False))
 
         if self.selected_device_name:
-            self.select_device(self.selected_device_name)
+            self.select_device(self.selected_device_name, refresh_hosts=False)
         else:
             self._fill_details(None)
         if self.active_editor_device and self.active_editor_device in self.devices:
@@ -2542,11 +2570,12 @@ class App:
         elif not self.opened_devices:
             self._show_cards_view()
 
-    def select_device(self, name: str) -> None:
+    def select_device(self, name: str, *, refresh_hosts: bool = True) -> None:
         if name not in self.devices:
             return
         self.selected_device_name = name
-        self._refresh_right_hosts()
+        if refresh_hosts:
+            self._refresh_right_hosts()
         for device_name, canvas in self.card_canvases.items():
             if device_name == self.selected_device_name:
                 self._set_rounded_style(canvas, UI_COLORS["accent"], 2)
@@ -2697,39 +2726,7 @@ class App:
         return [new_name if item == old_name else item for item in members]
 
     def _replace_or_append_config_section(self, config_text: str, section_name: str, section_body: str) -> str:
-        target = f"config {section_name}".lower()
-        lines = config_text.splitlines()
-        start_idx = -1
-        end_idx = -1
-        depth = 0
-        in_target = False
-
-        for idx, raw in enumerate(lines):
-            line = raw.strip().lower()
-            if not in_target:
-                if line == target:
-                    in_target = True
-                    start_idx = idx
-                    depth = 1
-                continue
-            if line.startswith("config "):
-                depth += 1
-                continue
-            if line == "end":
-                depth -= 1
-                if depth == 0:
-                    end_idx = idx
-                    break
-
-        section_lines = section_body.splitlines()
-        if start_idx >= 0 and end_idx >= start_idx:
-            rebuilt = lines[:start_idx] + section_lines + lines[end_idx + 1 :]
-        else:
-            rebuilt = lines[:]
-            if rebuilt and rebuilt[-1].strip():
-                rebuilt.append("")
-            rebuilt.extend(section_lines)
-        return "\n".join(rebuilt).rstrip() + "\n"
+        return replace_or_append_config_section(config_text, section_name, section_body)
 
     def _persist_current_address_data_to_selected_config(self) -> bool:
         if self.last_parser is None:
@@ -2739,20 +2736,19 @@ class App:
             return False
 
         parser = self.last_parser
-        address_lines: List[str] = ["config firewall address"]
-        for name in sorted(parser.address_objects.keys(), key=str.lower):
-            address_lines.extend(parser._build_address_command_block(name))  # type: ignore[attr-defined]
-        address_lines.append("end")
+        try:
+            safe_config = self._ensure_device_vault_path(record.config_path, must_exist=True)
+        except ValueError:
+            messagebox.showerror("Ошибка доступа", "Нельзя записать конфиг вне devices vault.")
+            return False
 
-        group_lines: List[str] = ["config firewall addrgrp"]
-        for name in sorted(parser.address_group_objects.keys(), key=str.lower):
-            group_lines.extend(parser._build_addrgrp_command_block(name))  # type: ignore[attr-defined]
-        group_lines.append("end")
+        address_lines = parser.render_address_config_lines()
+        group_lines = parser.render_addrgrp_config_lines()
 
-        text = record.config_path.read_text(encoding="utf-8", errors="ignore")
+        text = safe_config.read_text(encoding="utf-8", errors="ignore")
         text = self._replace_or_append_config_section(text, "firewall address", "\n".join(address_lines))
         text = self._replace_or_append_config_section(text, "firewall addrgrp", "\n".join(group_lines))
-        record.config_path.write_text(text, encoding="utf-8")
+        safe_config.write_text(text, encoding="utf-8")
         self.status_var.set(f"Конфиг устройства '{record.name}' обновлен по примененным командам.")
         self._load_devices()
         self.select_device(record.name)
@@ -2811,12 +2807,18 @@ class App:
 
         def on_create() -> None:
             try:
-                device_name = self._create_device_from_config(name_var.get(), config_var.get())
+                device_name = self._create_device_from_config(name_var.get())
             except Exception as exc:
                 status_var.set(str(exc))
                 return
             dialog.destroy()
             self.select_device(device_name)
+            if config_var.get().strip():
+                self._attach_config_to_device_async(
+                    device_name,
+                    Path(config_var.get().strip()).expanduser(),
+                    final_status=f"Устройство '{device_name}' добавлено. Конфиг, Excel и CSV созданы.",
+                )
 
         self._create_round_button(actions, "Создать", on_create).pack(side="right")
         self._create_round_button(actions, "Отмена", dialog.destroy, style_kind="ghost").pack(side="right", padx=(0, 8))
@@ -2829,7 +2831,31 @@ class App:
         if file_path:
             target_var.set(file_path)
 
-    def _create_device_from_config(self, raw_name: str, source_config: str) -> str:
+    def _is_device_vault_path(self, path: Path, *, must_exist: bool = True) -> bool:
+        try:
+            ensure_under_root(path, DEVICES_DIR.resolve(), must_exist=must_exist)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_device_vault_path(self, path: Path, *, must_exist: bool = True) -> Path:
+        return ensure_under_root(path, DEVICES_DIR.resolve(), must_exist=must_exist)
+
+    def _record_perf(self, metric: str, started_at: float, **extra: object) -> None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self.perf_recorder.record(metric, elapsed_ms, extra if extra else None)
+
+    @staticmethod
+    def _sanitize_dataframe_for_csv(df):
+        sanitized = df.copy()
+        for col_name in sanitized.columns:
+            if sanitized[col_name].dtype == object:
+                sanitized[col_name] = sanitized[col_name].map(
+                    lambda value: sanitize_spreadsheet_text(value) if isinstance(value, str) else value
+                )
+        return sanitized
+
+    def _create_device_from_config(self, raw_name: str) -> str:
         safe_name = sanitize_device_name(raw_name)
         if not safe_name:
             raise ValueError("Введите корректное имя устройства.")
@@ -2841,36 +2867,65 @@ class App:
             )
             if not should_replace:
                 raise RuntimeError("Создание отменено пользователем.")
-            shutil.rmtree(device_dir)
+            safe_dir = self._ensure_device_vault_path(device_dir, must_exist=True)
+            shutil.rmtree(safe_dir)
         device_dir.mkdir(parents=True, exist_ok=True)
-        if source_config.strip():
-            self._attach_config_to_device(safe_name, Path(source_config).expanduser())
-            self.status_var.set(f"Устройство '{safe_name}' добавлено. Конфиг, Excel и CSV созданы.")
-        else:
-            self.status_var.set(f"Устройство '{safe_name}' добавлено без конфига.")
+        self.status_var.set(f"Устройство '{safe_name}' добавлено без конфига.")
         self._load_devices()
         return safe_name
 
     def _attach_config_to_device(self, device_name: str, source_config: Path) -> None:
+        started_at = time.perf_counter()
         src = source_config.expanduser()
         if not src.exists():
             raise FileNotFoundError("Файл конфигурации не найден.")
+        if src.is_symlink():
+            raise ValueError("Символические ссылки не поддерживаются для исходного конфига.")
         device_dir = DEVICES_DIR / device_name
         device_dir.mkdir(parents=True, exist_ok=True)
+        safe_device_dir = self._ensure_device_vault_path(device_dir, must_exist=True)
 
-        config_target = device_dir / f"{device_name}.conf"
-        excel_target = device_dir / f"{device_name}_analysis.xlsx"
-        csv_target = device_dir / f"{device_name}_analysis.csv"
+        config_target = safe_device_dir / f"{device_name}.conf"
+        excel_target = safe_device_dir / f"{device_name}_analysis.xlsx"
+        csv_target = safe_device_dir / f"{device_name}_analysis.csv"
         shutil.copy2(src, config_target)
 
-        self.status_var.set(f"Анализируем конфиг устройства '{device_name}'...")
+        parser_started = time.perf_counter()
         parser = analyze_config(config_target, excel_target)
+        self._record_perf("parser.analyze_config", parser_started, device=device_name, source=str(config_target))
+        for step_name, duration in parser.profile.items():
+            self.perf_recorder.record(
+                f"parser.{step_name}",
+                duration * 1000.0,
+                {"device": device_name, "source": str(config_target)},
+            )
         self.last_parser = parser
 
         # CSV нужен для быстрого просмотра/импорта в другие инструменты.
         sheet = next(iter(parser.dataframes.values()), None)
         if sheet is not None:
-            sheet.to_csv(csv_target, index=False, encoding="utf-8-sig")
+            safe_sheet = self._sanitize_dataframe_for_csv(sheet)
+            safe_sheet.to_csv(csv_target, index=False, encoding="utf-8-sig")
+        self._record_perf("device.attach_config", started_at, device=device_name)
+
+    def _attach_config_to_device_async(self, device_name: str, source_config: Path, *, final_status: str) -> None:
+        self.status_var.set(f"Анализируем конфиг устройства '{device_name}'...")
+
+        def worker() -> None:
+            try:
+                self._attach_config_to_device(device_name, source_config)
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("Ошибка", str(exc)))
+                return
+
+            def on_done() -> None:
+                self.status_var.set(final_status)
+                self._load_devices()
+                self.select_device(device_name)
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def attach_config_to_selected_device(self) -> None:
         record = self._get_selected_device()
@@ -2882,14 +2937,11 @@ class App:
         )
         if not file_path:
             return
-        try:
-            self._attach_config_to_device(record.name, Path(file_path))
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        self.status_var.set(f"Конфиг устройства '{record.name}' обновлен. Excel и CSV пересобраны.")
-        self._load_devices()
-        self.select_device(record.name)
+        self._attach_config_to_device_async(
+            record.name,
+            Path(file_path),
+            final_status=f"Конфиг устройства '{record.name}' обновлен. Excel и CSV пересобраны.",
+        )
 
     def _get_selected_device(self) -> Optional[DeviceRecord]:
         if not self.selected_device_name:
@@ -2923,6 +2975,9 @@ class App:
         self._open_path(record.excel_path)
 
     def _open_path(self, target: Path) -> None:
+        if not self._is_device_vault_path(target, must_exist=True):
+            messagebox.showerror("Ошибка доступа", "Открытие файла вне devices vault запрещено.")
+            return
         if not target.exists():
             messagebox.showerror("Файл не найден", f"Файл не найден:\n{target}")
             return
@@ -2945,13 +3000,15 @@ class App:
         )
         if not confirmed:
             return
-        shutil.rmtree(record.folder, ignore_errors=False)
+        safe_folder = self._ensure_device_vault_path(record.folder, must_exist=True)
+        shutil.rmtree(safe_folder, ignore_errors=False)
         self.selected_device_name = None
         self.last_parser = None
         self.status_var.set(f"Устройство '{record.name}' удалено.")
         self._load_devices()
 
-    def _load_parser_for_selected_device(self) -> Optional[FortigateConfigParser]:
+    def _load_parser_for_selected_device(self, profile: str = "full") -> Optional[FortigateConfigParser]:
+        started_at = time.perf_counter()
         record = self._get_selected_device()
         if not record:
             return None
@@ -2961,99 +3018,77 @@ class App:
         if not record.config_path.exists():
             messagebox.showerror("Ошибка", f"Конфиг не найден:\n{record.config_path}")
             return None
-        parser = FortigateConfigParser(str(record.config_path))
-        parser.parse_all()
+        try:
+            safe_config = self._ensure_device_vault_path(record.config_path, must_exist=True)
+        except ValueError:
+            messagebox.showerror("Ошибка доступа", "Конфиг находится вне devices vault.")
+            return None
+        parse_profile = "addresses" if profile == "addresses" else "full"
+        mtime = safe_config.stat().st_mtime
+        cache_key = (str(safe_config), mtime, parse_profile)
+        cache_hit = cache_key in self._parser_cache
+        parser = self._parser_cache.get(cache_key)
+        if not cache_hit or parser is None:
+            parser = FortigateConfigParser(str(safe_config))
+            if parse_profile == "addresses":
+                parser.parse_addresses_only()
+            else:
+                parser.parse_all()
+            self._parser_cache[cache_key] = parser
+            # Drop stale cache entries for the same file/profile.
+            stale_keys = [
+                key
+                for key in self._parser_cache
+                if key[0] == str(safe_config) and key[2] == parse_profile and key[1] != mtime
+            ]
+            for stale_key in stale_keys:
+                self._parser_cache.pop(stale_key, None)
+            for step_name, duration in parser.profile.items():
+                self.perf_recorder.record(
+                    f"parser.{step_name}",
+                    duration * 1000.0,
+                    {"device": record.name, "source": str(safe_config), "cache_hit": False, "profile": parse_profile},
+                )
         self.last_parser = parser
+        self._record_perf(
+            "parser.load_selected_device",
+            started_at,
+            device=record.name,
+            cache_hit=cache_hit,
+            profile=parse_profile,
+        )
         return parser
 
     @staticmethod
     def _extract_first_ipv4(value: str) -> Optional[int]:
-        match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", value)
-        if not match:
-            return None
-        try:
-            return int(ipaddress.ip_address(match.group(0)))
-        except ValueError:
-            return None
+        return extract_first_ipv4(value)
 
     @staticmethod
     def _subnet_to_display(subnet: str) -> str:
-        parts = subnet.split()
-        if len(parts) != 2:
-            return subnet
-        try:
-            network = ipaddress.IPv4Network((parts[0], parts[1]), strict=False)
-        except ValueError:
-            return subnet
-        return f"{parts[0]}/{network.prefixlen}"
+        return subnet_to_display(subnet)
 
     @staticmethod
     def _normalize_subnet_value(raw_value: str) -> str:
-        value = raw_value.strip()
-        if not value:
-            raise ValueError("Subnet не может быть пустым.")
-        if "/" in value:
-            iface = ipaddress.ip_interface(value)
-            return f"{iface.ip} {iface.network.netmask}"
-        parts = value.split()
-        if len(parts) != 2:
-            raise ValueError("Subnet должен быть в формате 10.0.0.0/24 или 10.0.0.0 255.255.255.0.")
-        ipaddress.ip_address(parts[0])
-        ipaddress.ip_address(parts[1])
-        return f"{parts[0]} {parts[1]}"
+        return normalize_subnet_value(raw_value)
 
     @staticmethod
     def _normalize_iprange_value(raw_value: str) -> str:
-        value = raw_value.strip()
-        if not value:
-            raise ValueError("IP range не может быть пустым.")
-        if "-" in value:
-            parts = [part.strip() for part in value.split("-", maxsplit=1)]
-        else:
-            parts = value.split()
-        if len(parts) != 2:
-            raise ValueError("IP range должен быть в формате 10.0.0.1-10.0.0.254.")
-        ipaddress.ip_address(parts[0])
-        ipaddress.ip_address(parts[1])
-        return f"{parts[0]} {parts[1]}"
+        return normalize_iprange_value(raw_value)
 
     def _get_address_display_value(self, address_name: str) -> str:
         if self.last_parser is None:
             return ""
-        obj = self.last_parser.address_objects.get(address_name, {})
-        fqdn_value = obj.get("fqdn", "").strip()
-        if fqdn_value:
-            return fqdn_value
-        iprange_value = obj.get("iprange", "").strip()
-        if iprange_value:
-            parts = iprange_value.split()
-            if len(parts) >= 2:
-                return f"{parts[0]} - {parts[1]}"
-            return iprange_value
-        subnet_value = obj.get("subnet", "").strip()
-        if subnet_value:
-            return self._subnet_to_display(subnet_value)
-        return obj.get("type", "").strip()
+        return get_address_display_value(self.last_parser.address_objects, address_name)
 
     def _address_sort_key(self, address_name: str) -> Tuple[int, object, str]:
-        display = self._get_address_display_value(address_name)
-        numeric_ip = self._extract_first_ipv4(display)
-        if numeric_ip is not None:
-            return (0, numeric_ip, address_name.lower())
-        if display:
-            return (1, display.lower(), address_name.lower())
-        return (2, address_name.lower(), address_name.lower())
+        if self.last_parser is None:
+            return (2, address_name.lower(), address_name.lower())
+        return address_sort_key(self.last_parser.address_objects, address_name)
 
     def _address_sort_mode_key(self, address_name: str, sort_mode: str) -> Tuple[int, object, str]:
-        if sort_mode.startswith("name_"):
-            return (0, address_name.lower(), address_name.lower())
-        display = self._get_address_display_value(address_name)
-        numeric_ip = self._extract_first_ipv4(display)
-        if numeric_ip is not None:
-            return (0, numeric_ip, address_name.lower())
-        if display:
-            return (1, display.lower(), address_name.lower())
-        return (2, address_name.lower(), address_name.lower())
+        if self.last_parser is None:
+            return (2, address_name.lower(), address_name.lower())
+        return address_sort_mode_key(self.last_parser.address_objects, address_name, sort_mode)
 
     def _get_address_editor_state(self, address_name: str) -> Tuple[str, str]:
         assert self.last_parser is not None
@@ -3136,34 +3171,7 @@ class App:
             value_shell.pack(side="left", fill="x", expand=True)
             field_vars[name] = (type_var, value_var)
 
-        def _scroll_units_from_event(event: tk.Event) -> int:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                return -1 if delta > 0 else 1
-            num = getattr(event, "num", 0)
-            if num == 4:
-                return -1
-            if num == 5:
-                return 1
-            return 0
-
-        def _on_mousewheel(event: tk.Event) -> str:
-            units = _scroll_units_from_event(event)
-            if units:
-                canvas.yview_scroll(units, "units")
-                return "break"
-            return ""
-
-        def _bind_mousewheel_recursive(widget: tk.Widget) -> None:
-            widget.bind("<MouseWheel>", _on_mousewheel)
-            widget.bind("<Button-4>", _on_mousewheel)
-            widget.bind("<Button-5>", _on_mousewheel)
-            for child in widget.winfo_children():
-                _bind_mousewheel_recursive(child)
-
-        _bind_mousewheel_recursive(editor_wrap)
-        _bind_mousewheel_recursive(rows_frame)
-        _bind_mousewheel_recursive(canvas)
+        self._bind_vertical_mousewheel(canvas, canvas, rows_frame, editor_wrap, dialog)
 
         saved = {"done": False}
         actions = tk.Frame(dialog, bg=UI_COLORS["bg"])
@@ -3294,34 +3302,7 @@ class App:
             ).pack(side="right")
             color_vars[name] = row_var
 
-        def _scroll_units_from_event(event: tk.Event) -> int:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                return -1 if delta > 0 else 1
-            num = getattr(event, "num", 0)
-            if num == 4:
-                return -1
-            if num == 5:
-                return 1
-            return 0
-
-        def _on_mousewheel(event: tk.Event) -> str:
-            units = _scroll_units_from_event(event)
-            if units:
-                canvas.yview_scroll(units, "units")
-                return "break"
-            return ""
-
-        def _bind_mousewheel_recursive(widget: tk.Widget) -> None:
-            widget.bind("<MouseWheel>", _on_mousewheel)
-            widget.bind("<Button-4>", _on_mousewheel)
-            widget.bind("<Button-5>", _on_mousewheel)
-            for child in widget.winfo_children():
-                _bind_mousewheel_recursive(child)
-
-        _bind_mousewheel_recursive(content_wrap)
-        _bind_mousewheel_recursive(rows_frame)
-        _bind_mousewheel_recursive(canvas)
+        self._bind_vertical_mousewheel(canvas, canvas, rows_frame, content_wrap, dialog)
 
         def apply_to_all() -> None:
             selected_option = apply_all_var.get().strip()
@@ -3411,15 +3392,24 @@ class App:
         vars_map: Dict[str, tk.BooleanVar] = {}
         widgets_map: Dict[str, tk.Frame] = {}
         searchable_map: Dict[str, str] = {}
+        right_text_by_name: Dict[str, str] = {}
+        visible_names_cache: List[str] = []
+        visible_name_set: Set[str] = set()
         for name in items:
             var = tk.BooleanVar(value=False)
             vars_map[name] = var
             right_text = (right_text_map or {}).get(name, "")
+            right_text_by_name[name] = right_text
+            searchable_map[name] = f"{name} {right_text}".lower()
+
+        def _create_row_widget(name: str) -> tk.Frame:
             row = tk.Frame(frame, bg=UI_COLORS["panel"])
+            row.configure(cursor="hand2")
+            row_var = vars_map[name]
             chk = tk.Checkbutton(
                 row,
                 text=name,
-                variable=var,
+                variable=row_var,
                 anchor="w",
                 justify="left",
                 bg=UI_COLORS["panel"],
@@ -3429,8 +3419,10 @@ class App:
                 activeforeground=UI_COLORS["text"],
             )
             chk.pack(side="left", fill="x", expand=True, anchor="w")
+            right_text = right_text_by_name.get(name, "")
+            right_label: Optional[tk.Label] = None
             if right_text:
-                tk.Label(
+                right_label = tk.Label(
                     row,
                     text=right_text,
                     anchor="e",
@@ -3438,12 +3430,29 @@ class App:
                     bg=UI_COLORS["panel"],
                     fg=UI_COLORS["muted"],
                     font=UI_FONTS["label_md"],
-                ).pack(side="right", padx=(6, 4))
-            row.pack(fill="x", anchor="w")
-            widgets_map[name] = row
-            searchable_map[name] = f"{name} {right_text}".lower()
+                    cursor="hand2",
+                )
+                right_label.pack(side="right", padx=(6, 4))
 
-        def apply_filter(*_args: object) -> None:
+            def _toggle_row(_event: tk.Event, row_state=row_var) -> str:
+                row_state.set(not row_state.get())
+                return "break"
+
+            row.bind("<Button-1>", _toggle_row)
+            if right_label is not None:
+                right_label.bind("<Button-1>", _toggle_row)
+            return row
+
+        def _ensure_row_widget(name: str) -> tk.Frame:
+            widget = widgets_map.get(name)
+            if widget is None:
+                widget = _create_row_widget(name)
+                widgets_map[name] = widget
+            return widget
+
+        def apply_filter() -> None:
+            nonlocal visible_names_cache, visible_name_set
+            started_at = time.perf_counter()
             query = filter_var.get().strip().lower()
             visible_names = [name for name in items if query in searchable_map.get(name, name.lower())]
 
@@ -3452,19 +3461,50 @@ class App:
                 reverse = current_mode.endswith("_desc")
                 visible_names = sorted(visible_names, key=lambda name: sort_key_builder(name, current_mode), reverse=reverse)
 
-            for widget in widgets_map.values():
-                if widget.winfo_ismapped():
-                    widget.pack_forget()
-            for name in visible_names:
-                widgets_map[name].pack(fill="x", anchor="w")
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            new_visible_set = set(visible_names)
+            if visible_names == visible_names_cache:
+                return
+
+            render_batch_id = object()
+            active_batch["id"] = render_batch_id
+
+            # Hide rows that are no longer visible.
+            for name in (visible_name_set - new_visible_set):
+                row_widget = widgets_map.get(name)
+                if row_widget is None:
+                    continue
+                if row_widget.winfo_ismapped():
+                    row_widget.pack_forget()
+
+            visible_names_cache = visible_names
+            visible_name_set = new_visible_set
+
+            def render_batch(start_index: int = 0) -> None:
+                if active_batch.get("id") is not render_batch_id:
+                    return
+                batch_end = min(start_index + 120, len(visible_names_cache))
+                for name in visible_names_cache[start_index:batch_end]:
+                    row_widget = _ensure_row_widget(name)
+                    if row_widget.winfo_ismapped():
+                        row_widget.pack_forget()
+                    row_widget.pack(fill="x", anchor="w")
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                if batch_end < len(visible_names_cache):
+                    self.root.after(1, lambda: render_batch(batch_end))
+
+            render_batch()
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            if elapsed_ms >= 16.0:
+                self.perf_recorder.record(
+                    "ui.checklist_filter",
+                    elapsed_ms,
+                    {"title": title, "query_len": len(query), "visible_items": len(visible_names)},
+                )
 
         def select_filtered(select_value: bool) -> None:
-            query = filter_var.get().strip().lower()
-            for name, var in vars_map.items():
-                if query and query not in searchable_map.get(name, name.lower()):
-                    continue
-                var.set(select_value)
+            target_names = visible_names_cache if visible_names_cache else items
+            for name in target_names:
+                vars_map[name].set(select_value)
 
         select_all_btn = self._create_round_button(controls_left, "Выбрать все", lambda: select_filtered(True), style_kind="ghost")
         select_all_btn.configure(width=180)
@@ -3509,41 +3549,27 @@ class App:
                     label=label,
                     value=mode,
                     variable=sort_var,
-                    command=lambda: (_refresh_sort_button_text(), apply_filter()),
+                    command=lambda: (_refresh_sort_button_text(), _schedule_filter_apply()),
                 )
             _refresh_sort_button_text()
 
-        filter_var.trace_add("write", apply_filter)
+        pending_filter_job: Dict[str, Optional[str]] = {"id": None}
+        active_batch: Dict[str, object] = {"id": object()}
+
+        # Tk returns an identifier string from after(); assign explicitly to keep mypy happy.
+        def _schedule_filter_apply(*_args: object) -> None:
+            if pending_filter_job["id"] is not None:
+                self.root.after_cancel(pending_filter_job["id"])
+            pending_filter_job["id"] = self.root.after(120, _run_filter_apply)
+
+        def _run_filter_apply() -> None:
+            pending_filter_job["id"] = None
+            apply_filter()
+
+        filter_var.trace_add("write", _schedule_filter_apply)
         apply_filter()
 
-        def _scroll_units_from_event(event: tk.Event) -> int:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                return -1 if delta > 0 else 1
-            num = getattr(event, "num", 0)
-            if num == 4:
-                return -1
-            if num == 5:
-                return 1
-            return 0
-
-        def _on_mousewheel(event: tk.Event) -> str:
-            units = _scroll_units_from_event(event)
-            if units:
-                canvas.yview_scroll(units, "units")
-                return "break"
-            return ""
-
-        def _bind_mousewheel_recursive(widget: tk.Widget) -> None:
-            widget.bind("<MouseWheel>", _on_mousewheel)
-            widget.bind("<Button-4>", _on_mousewheel)
-            widget.bind("<Button-5>", _on_mousewheel)
-            for child in widget.winfo_children():
-                _bind_mousewheel_recursive(child)
-
-        _bind_mousewheel_recursive(container)
-        _bind_mousewheel_recursive(frame)
-        _bind_mousewheel_recursive(canvas)
+        self._bind_vertical_mousewheel(canvas, canvas, frame, container, filter_frame, controls)
 
         return vars_map
 
@@ -3557,7 +3583,7 @@ class App:
         if reuse_current_parser and self.last_parser is not None:
             parser = self.last_parser
         else:
-            parser = self._load_parser_for_selected_device()
+            parser = self._load_parser_for_selected_device(profile="addresses")
             if parser is None:
                 return
             self.last_parser = parser
@@ -3763,27 +3789,7 @@ class App:
                     if initial_address_color_overrides and address_name in initial_address_color_overrides:
                         address_color_map[address_name].set(format_fortigate_color_option(initial_address_color_overrides[address_name]))
 
-            def _on_color_mousewheel(event: tk.Event) -> str:
-                delta = getattr(event, "delta", 0)
-                if delta > 0:
-                    color_canvas.yview_scroll(-1, "units")
-                    return "break"
-                if delta < 0:
-                    color_canvas.yview_scroll(1, "units")
-                    return "break"
-                num = getattr(event, "num", 0)
-                if num == 4:
-                    color_canvas.yview_scroll(-1, "units")
-                    return "break"
-                if num == 5:
-                    color_canvas.yview_scroll(1, "units")
-                    return "break"
-                return ""
-
-            for widget in (color_canvas, color_frame, color_box):
-                widget.bind("<MouseWheel>", _on_color_mousewheel)
-                widget.bind("<Button-4>", _on_color_mousewheel)
-                widget.bind("<Button-5>", _on_color_mousewheel)
+            self._bind_vertical_mousewheel(color_canvas, color_canvas, color_frame, color_box)
 
         text_wrap_canvas, text_wrap = self._create_rounded_container(
             summary,
@@ -3939,8 +3945,21 @@ class App:
         actions = tk.Frame(dialog, bg=UI_COLORS["bg"])
         actions.pack(fill="x", padx=10, pady=(0, 10))
 
+        def _validate_cli_output(payload: str) -> None:
+            lines = [line for line in payload.splitlines() if line.strip()]
+            if len(lines) > 20000:
+                raise ValueError("Слишком большой CLI вывод для обработки (лимит: 20000 строк).")
+            normalized = payload.lower()
+            if "config firewall address" not in normalized and "config firewall addrgrp" not in normalized:
+                raise ValueError("Вставьте вывод секций firewall address/addrgrp для проверки дублей.")
+
         def on_generate() -> None:
             cli_output = output_text.get("1.0", "end").strip()
+            try:
+                _validate_cli_output(cli_output)
+            except ValueError as exc:
+                messagebox.showwarning("Невалидный ввод", str(exc), parent=dialog)
+                return
             existing_names = self.last_parser.parse_existing_object_names(cli_output)
             plan = self.last_parser.build_transfer_plan(
                 selected_addresses,
@@ -4083,19 +4102,41 @@ class App:
             return "FortiGateAnalyzer-macOS.pkg"
         raise RuntimeError(f"Платформа не поддерживается автообновлением: {platform.system()}")
 
-    def _fetch_latest_asset_url(self, asset_name: str) -> str:
+    def _fetch_latest_asset_urls(self, asset_name: str) -> Tuple[str, str]:
         api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
         with urlopen(api_url, timeout=15) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
+        asset_url = ""
+        checksum_url = ""
         for asset in payload.get("assets", []):
-            if asset.get("name") == asset_name:
-                return asset.get("browser_download_url", "")
-        raise RuntimeError(f"В релизе не найден файл: {asset_name}")
+            name = asset.get("name")
+            if name == asset_name:
+                asset_url = asset.get("browser_download_url", "")
+            elif name == f"{asset_name}.sha256":
+                checksum_url = asset.get("browser_download_url", "")
+        if not asset_url:
+            raise RuntimeError(f"В релизе не найден файл: {asset_name}")
+        if not checksum_url:
+            raise RuntimeError(f"В релизе не найден checksum файл: {asset_name}.sha256")
+        return asset_url, checksum_url
 
-    def _download_update_asset(self, url: str, filename: str) -> Path:
+    def _download_binary(self, url: str, target: Path) -> None:
+        with urlopen(url, timeout=60) as resp:
+            with target.open("wb") as handle:
+                shutil.copyfileobj(resp, handle)
+
+    def _fetch_asset_checksum(self, checksum_url: str, expected_filename: str) -> str:
+        with urlopen(checksum_url, timeout=30) as resp:
+            payload = resp.read().decode("utf-8", errors="ignore")
+        return parse_sha256_file(payload, expected_filename=expected_filename)
+
+    def _download_update_asset(self, url: str, filename: str, expected_sha256: str) -> Path:
         temp_dir = Path(tempfile.mkdtemp(prefix="forti-update-"))
         target = temp_dir / filename
-        urlretrieve(url, target)
+        self._download_binary(url, target)
+        actual_sha = sha256_file(target)
+        if actual_sha.lower() != expected_sha256.lower():
+            raise RuntimeError("Скачанный установщик не прошел проверку SHA256.")
         return target
 
     def _run_installer_and_restart(self, installer_path: Path) -> None:
@@ -4153,9 +4194,10 @@ class App:
 
                 try:
                     asset_name = self._get_platform_asset_name()
-                    asset_url = self._fetch_latest_asset_url(asset_name)
+                    asset_url, checksum_url = self._fetch_latest_asset_urls(asset_name)
+                    expected_sha = self._fetch_asset_checksum(checksum_url, asset_name)
                     self.status_var.set(f"Скачивание обновления {remote_version}...")
-                    installer = self._download_update_asset(asset_url, asset_name)
+                    installer = self._download_update_asset(asset_url, asset_name, expected_sha)
                     self.status_var.set("Запуск установщика обновления...")
                     self._run_installer_and_restart(installer)
                 except Exception as exc:
