@@ -143,3 +143,28 @@ end
     assert "edit \"GRP_PROD\"" in plan["commands_text"]
     assert "set color 6" in plan["commands_text"]
     assert "set member \"ADDR_WEB\" \"ADDR_API\"" in plan["commands_text"]
+
+
+def test_render_config_lines_public_api(tmp_path: Path) -> None:
+    parser = _make_parser(
+        tmp_path,
+        """
+config firewall address
+    edit "ADDR_ONE"
+        set subnet 10.0.0.1 255.255.255.255
+    next
+end
+config firewall addrgrp
+    edit "GRP_ONE"
+        set member "ADDR_ONE"
+    next
+end
+""",
+    )
+    parser.parse_addresses()
+    addr_lines = parser.render_address_config_lines()
+    grp_lines = parser.render_addrgrp_config_lines()
+    assert addr_lines[0] == "config firewall address"
+    assert grp_lines[0] == "config firewall addrgrp"
+    assert any('edit "ADDR_ONE"' in line for line in addr_lines)
+    assert any('edit "GRP_ONE"' in line for line in grp_lines)
