@@ -1,0 +1,16 @@
+[run]
+# Exclude files that are not meaningful to measure:
+# - app.py is a Tkinter GUI (~4500 lines) that requires a live display; business logic is minimal
+# - install.py is a build-time helper script, not production code
+omit =
+    install.py
+    app.py
+    tests/*
+    */site-packages/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    \.\.\.

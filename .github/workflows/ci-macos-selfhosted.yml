@@ -1,0 +1,35 @@
+name: CI macOS (self-hosted)
+
+# Runs on your registered Mac via GitHub Actions self-hosted runner.
+# To register: GitHub → repo → Settings → Actions → Runners → New self-hosted runner → macOS
+# Then: ./config.sh (with the token shown) → ./run.sh
+# For permanent background service: ./svc.sh install && ./svc.sh start
+
+on:
+  push:
+    branches: ["dev", "main"]
+  pull_request:
+    branches: ["dev", "main"]
+
+jobs:
+  test-macos-native:
+    runs-on: [self-hosted, macos]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip3 install -r requirements.txt pytest pytest-cov
+
+      - name: Run tests (native macOS, Tkinter available)
+        run: |
+          pytest -q --cov=. --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-macos
+          path: .coverage
+        if: always()

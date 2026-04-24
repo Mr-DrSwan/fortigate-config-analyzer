@@ -60,7 +60,6 @@ class FortigateConfigParser:
             'logtraffic': 'Логирование',
             'logtraffic-start': 'Логирование_начала',
             'capture-packet': 'Захват_пакетов',
-            'schedule': 'Расписание',
             'internet-service': 'Интернет_сервис',
             'internet-service-src': 'Источник_интернет_сервиса',
             'tcp-mss-sender': 'TCP_MSS_отправитель',
@@ -118,8 +117,6 @@ class FortigateConfigParser:
             'icap-profile': 'Профиль_ICAP',
             'cifs-profile': 'Профиль_CIFS',
             'videofilter-profile': 'Профиль_видеофильтра',
-            'ssh-filter-profile': 'Профиль_SSH_фильтра',
-            'profile-protocol-options': 'Опции_протокола',
             'ssl-mirror': 'SSL_зеркалирование',
             'ssl-mirror-intf': 'Интерфейс_SSL_зеркалирования',
             'wanopt': 'WAN_оптимизация',
@@ -131,21 +128,12 @@ class FortigateConfigParser:
             'webcache-https': 'Веб_кэш_HTTPS',
             'webproxy-forward-server': 'Прямой_сервер_прокси',
             'webproxy-profile': 'Профиль_веб_прокси',
-            'ztna-ems-tag': 'Тег_ZTNA_EMS',
-            'ztna-geo-tag': 'Тег_ZTNA_гео',
         }
 
     def _read_config(self) -> str:
         """Чтение файла конфигурации"""
-        try:
-            with open(self.config_file, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        except FileNotFoundError:
-            print(f"❌ Файл не найден: {self.config_file}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"❌ Ошибка чтения файла: {e}")
-            sys.exit(1)
+        with open(self.config_file, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
 
     def _build_section_ranges(self) -> Dict[str, List[Tuple[int, int]]]:
         ranges: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
@@ -175,8 +163,6 @@ class FortigateConfigParser:
     def _parse_set_value(raw_value: str) -> str:
         value = raw_value.strip()
         if '"' not in value:
-            if value.startswith('"') and value.endswith('"'):
-                return value[1:-1]
             return value
         extracted: List[str] = []
         in_quotes = False
@@ -253,6 +239,10 @@ class FortigateConfigParser:
     @staticmethod
     def parse_existing_object_names(cli_output: str) -> Set[str]:
         """Parse `edit ...` object names from FortiGate CLI output."""
+        index = FortigateConfigParser.parse_existing_object_index(cli_output)
+        names = set(index["address"].keys()) | set(index["addrgrp"].keys())
+        if names:
+            return names
         names: Set[str] = set()
         for raw_line in cli_output.splitlines():
             line = raw_line.strip()
@@ -264,6 +254,54 @@ class FortigateConfigParser:
             if value:
                 names.add(value)
         return names
+
+    @staticmethod
+    def parse_existing_object_index(cli_output: str) -> Dict[str, Dict[str, Dict[str, str]]]:
+        """Parse existing objects and their properties from CLI `show` output."""
+        result: Dict[str, Dict[str, Dict[str, str]]] = {"address": {}, "addrgrp": {}}
+        section: Optional[str] = None
+        current_name: Optional[str] = None
+
+        for raw_line in cli_output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if lower == "config firewall address":
+                section = "address"
+                current_name = None
+                continue
+            if lower == "config firewall addrgrp":
+                section = "addrgrp"
+                current_name = None
+                continue
+            if lower == "end":
+                section = None
+                current_name = None
+                continue
+            if section is None:
+                continue
+            if lower.startswith("edit "):
+                name = line[5:].strip()
+                if name.startswith('"') and name.endswith('"'):
+                    name = name[1:-1]
+                if not name:
+                    continue
+                current_name = name
+                result[section][name] = {"_name": name}
+                continue
+            if lower == "next":
+                current_name = None
+                continue
+            if lower.startswith("set ") and current_name:
+                parts = line.split(maxsplit=2)
+                if len(parts) < 2:
+                    continue
+                key = parts[1]
+                value = parts[2] if len(parts) > 2 else ""
+                result[section][current_name][key] = FortigateConfigParser._parse_set_value(value)
+
+        return result
 
     @staticmethod
     def _quote(value: str) -> str:
@@ -425,41 +463,117 @@ class FortigateConfigParser:
         selected_addresses: Set[str],
         selected_groups: Set[str],
         existing_names: Set[str],
+        existing_index: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
         group_color_overrides: Optional[Dict[str, int]] = None,
         address_color_overrides: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         """Build transfer command plan while skipping duplicates on target."""
         group_color_overrides = group_color_overrides or {}
         address_color_overrides = address_color_overrides or {}
+        existing_index = existing_index or {"address": {}, "addrgrp": {}}
+        existing_address_map = existing_index.get("address", {})
+        existing_group_map = existing_index.get("addrgrp", {})
+        if existing_address_map or existing_group_map:
+            existing_address_names = set(existing_address_map.keys())
+            existing_group_names = set(existing_group_map.keys())
+        else:
+            existing_address_names = set(existing_names)
+            existing_group_names = set(existing_names)
+
+        def _to_color_code(raw: str) -> Optional[int]:
+            text = str(raw).strip()
+            return int(text) if text.isdigit() else None
+
+        def _group_color(group_name: str) -> Optional[int]:
+            if group_name in group_color_overrides:
+                return group_color_overrides[group_name]
+            obj = self.address_group_objects.get(group_name, {})
+            return _to_color_code(obj.get("color", ""))
+
         expanded_group_members: Set[str] = set()
-        for group_name in selected_groups:
-            expanded_group_members.update(self.address_group_members.get(group_name, []))
+        inherited_address_colors: Dict[str, int] = {}
+        group_effective_colors: Dict[str, int] = {}
+        visiting: Set[str] = set()
+
+        def _walk_group(group_name: str, inherited_color: Optional[int]) -> None:
+            if group_name in visiting:
+                return
+            visiting.add(group_name)
+            current_color = _group_color(group_name)
+            effective_color = current_color if current_color is not None else inherited_color
+            if current_color is not None:
+                group_effective_colors[group_name] = current_color
+            members = self.address_group_members.get(group_name, [])
+            for member in members:
+                if member in self.address_group_objects:
+                    _walk_group(member, effective_color)
+                    continue
+                expanded_group_members.add(member)
+                if effective_color is not None and member not in inherited_address_colors:
+                    inherited_address_colors[member] = effective_color
+            visiting.remove(group_name)
+
+        for group_name in sorted(selected_groups):
+            _walk_group(group_name, None)
 
         effective_addresses = set(selected_addresses) | expanded_group_members
-        duplicate_addresses = sorted(name for name in effective_addresses if name in existing_names)
-        duplicate_groups = sorted(name for name in selected_groups if name in existing_names)
+        effective_address_overrides: Dict[str, int] = dict(inherited_address_colors)
+        effective_address_overrides.update(address_color_overrides)
+        duplicate_addresses = sorted(name for name in effective_addresses if name in existing_address_names)
+        duplicate_groups = sorted(name for name in selected_groups if name in existing_group_names)
 
-        addresses_to_create = sorted(name for name in effective_addresses if name not in existing_names)
-        groups_to_create = sorted(name for name in selected_groups if name not in existing_names)
+        addresses_to_create = sorted(name for name in effective_addresses if name not in existing_address_names)
+        groups_to_create = sorted(name for name in selected_groups if name not in existing_group_names)
 
         command_lines: List[str] = []
         if addresses_to_create:
             command_lines.append("config firewall address")
             for name in addresses_to_create:
-                command_lines.extend(self._build_address_command_block(name, address_color_overrides.get(name)))
+                command_lines.extend(self._build_address_command_block(name, effective_address_overrides.get(name)))
             command_lines.append("end")
             command_lines.append("")
 
         # If address already exists on target, still allow explicit color update when user provided override.
-        existing_addresses_to_recolor = sorted(
-            name for name in duplicate_addresses if name in address_color_overrides
-        )
+        existing_addresses_to_recolor = []
+        for name in duplicate_addresses:
+            desired_color = effective_address_overrides.get(name)
+            if desired_color is None:
+                continue
+            explicit_override = name in address_color_overrides
+            if name not in existing_address_map and not explicit_override:
+                continue
+            current_color = _to_color_code(existing_address_map.get(name, {}).get("color", ""))
+            if current_color != desired_color:
+                existing_addresses_to_recolor.append(name)
+        existing_addresses_to_recolor = sorted(existing_addresses_to_recolor)
         if existing_addresses_to_recolor:
             command_lines.append("# Обновление цвета существующих адресов")
             command_lines.append("config firewall address")
             for name in existing_addresses_to_recolor:
                 command_lines.append(f'    edit {self._quote(name)}')
-                command_lines.append(f"        set color {address_color_overrides[name]}")
+                command_lines.append(f"        set color {effective_address_overrides[name]}")
+                command_lines.append("    next")
+            command_lines.append("end")
+            command_lines.append("")
+
+        existing_groups_to_recolor = []
+        for group_name in duplicate_groups:
+            desired_group_color = group_effective_colors.get(group_name)
+            if desired_group_color is None:
+                continue
+            explicit_group_override = group_name in group_color_overrides
+            if group_name not in existing_group_map and not explicit_group_override:
+                continue
+            current_group_color = _to_color_code(existing_group_map.get(group_name, {}).get("color", ""))
+            if current_group_color != desired_group_color:
+                existing_groups_to_recolor.append(group_name)
+        existing_groups_to_recolor = sorted(existing_groups_to_recolor)
+        if existing_groups_to_recolor:
+            command_lines.append("# Обновление цвета существующих групп")
+            command_lines.append("config firewall addrgrp")
+            for group_name in existing_groups_to_recolor:
+                command_lines.append(f'    edit {self._quote(group_name)}')
+                command_lines.append(f"        set color {group_effective_colors[group_name]}")
                 command_lines.append("    next")
             command_lines.append("end")
             command_lines.append("")
@@ -467,7 +581,7 @@ class FortigateConfigParser:
         if groups_to_create:
             command_lines.append("config firewall addrgrp")
             for name in groups_to_create:
-                command_lines.extend(self._build_addrgrp_command_block(name, group_color_overrides.get(name)))
+                command_lines.extend(self._build_addrgrp_command_block(name, group_effective_colors.get(name)))
             command_lines.append("end")
 
         if not command_lines:
@@ -478,6 +592,8 @@ class FortigateConfigParser:
             "duplicate_groups": duplicate_groups,
             "addresses_to_create": addresses_to_create,
             "groups_to_create": groups_to_create,
+            "existing_addresses_to_recolor": existing_addresses_to_recolor,
+            "existing_groups_to_recolor": existing_groups_to_recolor,
             "commands_text": "\n".join(command_lines).strip(),
         }
 
@@ -835,7 +951,7 @@ class FortigateConfigParser:
                                     cell_length = len(str(cell.value))
                                     if cell_length > max_length:
                                         max_length = cell_length
-                                except:
+                                except Exception:
                                     pass
                             adjusted_width = min(max_length + 2, 50)
                             worksheet.column_dimensions[column_letter].width = adjusted_width
@@ -889,7 +1005,14 @@ def main():
             sys.exit(1)
 
     # Создаем парсер
-    parser = FortigateConfigParser(config_file)
+    try:
+        parser = FortigateConfigParser(config_file)
+    except FileNotFoundError:
+        print(f"❌ Файл не найден: {config_file}")
+        sys.exit(1)
+    except OSError as e:
+        print(f"❌ Ошибка чтения файла: {e}")
+        sys.exit(1)
 
     # Парсим все
     parser.parse_all()
@@ -918,9 +1041,8 @@ def main():
 if __name__ == "__main__":
     # Проверяем зависимости
     try:
-        import pandas as pd
-        import openpyxl
-    except ImportError as e:
+        import pandas as pd  # noqa: F401
+    except ImportError:
         print("❌ Отсутствуют необходимые библиотеки!")
         print("Установите их командой:")
         print("  pip install pandas openpyxl")
