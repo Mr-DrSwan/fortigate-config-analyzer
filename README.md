@@ -2,84 +2,69 @@
 
 ![Forti meme cover](assets/cover-meme.png)
 
-Это приложение разбирает конфиг FortiGate (`.conf`) и делает понятный `Excel (.xlsx)` отчет.
+Разбирает конфиг FortiGate (`.conf`) и генерирует читаемый Excel-отчёт.
 
-Нужно быстро посмотреть, что настроено в фаерволе? Это как раз для этого.
+**Что попадает в отчёт:**
+- локальные пользователи и группы
+- правила фаервола (с расширенными полями)
+- IPSec туннели
+- статические маршруты
+- NAT (VIP / port-forward)
+- адреса и группы адресов
+- VPN пользователи
 
-Что попадает в отчет:
+## Скачать готовую версию
 
-- локальные пользователи и группы;
-- правила фаервола (включая много дополнительных полей);
-- IPSec туннели;
-- статические маршруты;
-- NAT (VIP / port-forward);
-- адреса и группы адресов;
-- VPN пользователи.
+- Windows: [FortiGateAnalyzer-Setup.exe](https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-Setup.exe)
+- macOS: [FortiGateAnalyzer-macOS.pkg](https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.pkg)
 
-## Скачать готовую версию (установщики)
+## Быстрый старт
 
-- Windows Installer (`Setup.exe`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-Setup.exe
-- macOS Installer (`.pkg`): https://github.com/Mr-DrSwan/fortigate-config-analyzer/releases/latest/download/FortiGateAnalyzer-macOS.pkg
+```bash
+pip install -r requirements.txt
+python3 app.py
+```
 
-## Быстрый старт (Python)
-
-1. Открой терминал в папке проекта:
-   - `cd FortiGate_Analyzer`
-2. Установи зависимости:
-   - `python3 -m pip install -r requirements.txt`
-3. Запусти GUI:
-   - `python3 app.py`
-
-## CLI режим
-
-- `python3 app.py --input "/path/to/fortigate.conf" --output "/path/to/result.xlsx"`
+**CLI:**
+```bash
+python3 app.py --input /path/to/fortigate.conf --output result.xlsx
+```
 
 ## Локальная сборка
 
-### Windows
-
-1. `python -m pip install -r requirements.txt`
-2. `pyinstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py`
-3. Готовый файл:
-   - `dist/FortiGateAnalyzer.exe`
-4. Установщик (Inno Setup):
-   - установи Inno Setup 6
-   - запусти `build_installer.bat`
-   - получишь `dist/FortiGateAnalyzer-Setup.exe`
-
 ### macOS
 
-1. `python3 -m pip install -r requirements.txt`
-2. `pyinstaller --noconfirm --windowed --icon assets/forti-analyzer-icon.icns --name FortiGateAnalyzer app.py`
-3. Готовый файл:
-   - `dist/FortiGateAnalyzer.app`
-4. Установщик macOS:
-   - `productbuild --component dist/FortiGateAnalyzer.app /Applications dist/FortiGateAnalyzer-macOS.pkg`
+```bash
+pip install -r requirements.txt
+python3 -m PyInstaller --noconfirm FortiGateAnalyzer.spec --distpath local_build
+# → local_build/FortiGateAnalyzer.app
+```
 
-## Тесты (ветка dev)
+### Windows
 
-Добавлены автотесты `pytest` в `tests/test_parser.py`:
+```bash
+pip install -r requirements.txt
+python -m PyInstaller --noconfirm --onefile --windowed --icon assets/forti-analyzer-icon.ico --name FortiGateAnalyzer app.py
+# → dist/FortiGateAnalyzer.exe
+# Установщик: build_installer.bat (требует Inno Setup 6)
+```
 
-- проверка парсинга `edit/set` блоков из конфигурации;
-- проверка формирования и перевода колонок для firewall правил;
-- smoke-проверка структуры выходного `DataFrame`.
+## Тесты
 
-Запуск локально:
+```bash
+pip install pytest
+pytest -q
+```
 
-- `python3 -m pip install -r requirements.txt`
-- `python3 -m pip install pytest`
-- `pytest -q`
+Покрыто: парсер, утилиты адресов, конфиг-секции, безопасность, метрики производительности, GUI smoke-тест.
 
 ## CI/CD
 
-В проекте настроены workflow:
+- `ci.yml` — тесты при push/PR в `dev`, `main`
+- `build-windows-exe.yml` / `build-macos-app.yml` — сборка артефактов
+- `cd-release.yml` — публикация релиза при теге `v*`
 
-- `.github/workflows/ci.yml` — тесты на `push/pull_request` для `dev`, `main`, `master`;
-- `.github/workflows/build-windows-exe.yml` — сборка Windows;
-- `.github/workflows/build-macos-app.yml` — сборка macOS;
-- `.github/workflows/cd-release.yml` — автопубликация релиза при теге `v*`.
+## Ветки
 
-### Как работаем по веткам
-
-- все изменения вносим в `dev`;
-- `main` оставляем под стабильные релизы.
+- `dev` — текущая разработка
+- `main` — стабильные релизы

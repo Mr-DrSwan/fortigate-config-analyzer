@@ -12,6 +12,10 @@ build/
 dist/
 artifacts/
 release_assets/
+local_build/
+
+devices/
+Конфиги/
 
 *.xlsx
 *.conf

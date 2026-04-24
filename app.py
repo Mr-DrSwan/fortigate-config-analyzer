@@ -6,18 +6,15 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.error import URLError
-from urllib.request import urlopen
 
 from address_utils import (
     address_sort_key,
@@ -31,7 +28,24 @@ from address_utils import (
 from config_sections import replace_or_append_config_section
 from fortigate_analyzer import FortigateConfigParser
 from perf_metrics import PerfRecorder
-from security_utils import ensure_under_root, parse_sha256_file, sanitize_spreadsheet_text, sha256_file
+from security_utils import ensure_under_root, sanitize_spreadsheet_text
+from services.device_vault import (
+    APP_NAME,
+    DeviceRecord,
+    get_app_data_dir,
+    load_devices_from_disk,
+)
+from services.updater import (
+    download_update_asset,
+    fetch_asset_checksum,
+    fetch_latest_asset_urls,
+    fetch_remote_version,
+    get_display_version,
+    get_platform_asset_name,
+    is_newer_version,
+    parse_version,
+    run_installer,
+)
 
 
 CHECK_COMMAND_TEXT = """config firewall address
@@ -82,19 +96,7 @@ FORTIGATE_COLOR_OPTION_BY_CODE = {code: f"{name:<12} | {code:>2}" for code, name
 GITHUB_OWNER = "Mr-DrSwan"
 GITHUB_REPO = "fortigate-config-analyzer"
 APP_ROOT = Path(__file__).resolve().parent
-APP_NAME = "FortiGateAnalyzer"
 VERSION_FILE = APP_ROOT / "VERSION"
-
-
-def get_app_data_dir() -> Path:
-    system_name = platform.system().lower()
-    if system_name == "darwin":
-        return Path.home() / "Library" / "Application Support" / APP_NAME
-    if system_name == "windows":
-        appdata = os.getenv("APPDATA")
-        return Path(appdata) / APP_NAME if appdata else Path.home() / "AppData" / "Roaming" / APP_NAME
-    xdg_data_home = os.getenv("XDG_DATA_HOME")
-    return Path(xdg_data_home) / APP_NAME if xdg_data_home else Path.home() / ".local" / "share" / APP_NAME
 
 
 APP_DATA_DIR = get_app_data_dir() if getattr(sys, "frozen", False) else APP_ROOT
@@ -103,79 +105,89 @@ GITHUB_PROFILE_URL = f"https://github.com/{GITHUB_OWNER}"
 COPYRIGHT_TEXT = f"© {GITHUB_OWNER} (GitHub)"
 UI_STYLE_TOKENS = {
     "colors": {
-        "bg": "#1B2033",
-        "panel": "#232940",
-        "panel_soft": "#1F253A",
-        "panel_shadow": "#151A2B",
-        "line": "#2E3550",
-        "line_soft": "#3A4261",
-        "accent": "#3ED17F",
-        "accent_soft": "#4B7BE3",
-        "text": "#E9EEFF",
-        "muted": "#8F99B8",
-        "button_app_fg": "#E9EEFF",
-        "button_app_bg": "#2A314A",
-        "button_app_bg_active": "#343C59",
-        "button_app_bg_pressed": "#3E4769",
-        "button_app_bg_disabled": "#262C42",
-        "button_app_fg_disabled": "#6F7898",
-        "button_danger_fg": "#FFC9CD",
-        "button_danger_bg": "#4C2B36",
-        "button_danger_bg_active": "#603242",
-        "button_danger_bg_pressed": "#743A4E",
-        "entry_light": "#202741",
-        "scrollbar_track": "#262D45",
-        "scrollbar_thumb": "#8A94AF",
-        "scrollbar_thumb_active": "#A3ABC0",
-        "chip_hover": "#323B5A",
-        "button_primary_fill": "#2A314A",
-        "button_primary_hover": "#353E5D",
-        "button_primary_border": "#3E486B",
-        "button_primary_text": "#E9EEFF",
-        "button_danger_fill": "#4C2B36",
-        "button_danger_hover": "#623445",
-        "button_danger_border": "#7A4258",
-        "button_danger_text": "#FFC9CD",
-        "button_ghost_hover": "#2D3552",
+        # --- Termius-inspired palette ---
+        "bg": "#1C1E2B",
+        "sidebar": "#181A27",
+        "panel": "#242638",
+        "panel_soft": "#1E2030",
+        "panel_shadow": "#13141F",
+        "line": "#2A2D42",
+        "line_soft": "#33374F",
+        "accent": "#5B6BDF",
+        "accent_soft": "#4A5ACC",
+        "accent_hover": "#6B7BEF",
+        "text": "#E8EAF0",
+        "muted": "#7C8099",
+        "sidebar_item_hover": "#252840",
+        "sidebar_item_active": "#2E3150",
+        "sidebar_text_active": "#C8CCEF",
+        # --- buttons ---
+        "button_app_fg": "#E8EAF0",
+        "button_app_bg": "#2E3150",
+        "button_app_bg_active": "#363859",
+        "button_app_bg_pressed": "#3E4163",
+        "button_app_bg_disabled": "#242638",
+        "button_app_fg_disabled": "#555872",
+        "button_danger_fg": "#FFB3B8",
+        "button_danger_bg": "#4A2830",
+        "button_danger_bg_active": "#5C3038",
+        "button_danger_bg_pressed": "#6E3842",
+        "entry_light": "#1E2030",
+        "chip_hover": "#2C2F4A",
+        "button_primary_fill": "#353856",
+        "button_primary_hover": "#3D4062",
+        "button_primary_border": "#4A4E78",
+        "button_primary_text": "#E8EAF0",
+        "button_danger_fill": "#4A2830",
+        "button_danger_hover": "#5C3038",
+        "button_danger_border": "#6E4050",
+        "button_danger_text": "#FFB3B8",
+        "button_ghost_hover": "#282B44",
+        # --- window controls (keep macOS-standard) ---
         "window_ctrl_close": "#FF5F57",
         "window_ctrl_minimize": "#FEBB2E",
         "window_ctrl_maximize": "#28C840",
-        "window_ctrl_idle": "#3A415E",
-        "window_ctrl_idle_border": "#4A5274",
+        "window_ctrl_idle": "#383B56",
+        "window_ctrl_idle_border": "#484B6A",
     },
     "fonts": {
-        "label_xs": ("Helvetica", 8),
-        "label_sm": ("Helvetica", 9),
-        "label_sm_bold": ("Helvetica", 9, "bold"),
-        "label_md": ("Helvetica", 10),
-        "label_lg": ("Helvetica", 11),
-        "label_lg_bold": ("Helvetica", 11, "bold"),
+        "label_xs": ("Helvetica", 9),
+        "label_sm": ("Helvetica", 10),
+        "label_sm_bold": ("Helvetica", 10, "bold"),
+        "label_md": ("Helvetica", 11),
+        "label_lg": ("Helvetica", 12),
+        "label_lg_bold": ("Helvetica", 12, "bold"),
         "title_md_bold": ("Helvetica", 13, "bold"),
         "title_lg_bold": ("Helvetica", 15, "bold"),
-        "title_xl_bold": ("Helvetica", 17, "bold"),
-        "action_bold": ("Helvetica", 10, "bold"),
+        "title_xl_bold": ("Helvetica", 16, "bold"),
+        "action_bold": ("Helvetica", 11, "bold"),
+        "sidebar_item": ("Helvetica", 12),
+        "sidebar_item_bold": ("Helvetica", 12, "bold"),
+        "sidebar_logo": ("Helvetica", 13, "bold"),
+        "sidebar_logo_sub": ("Helvetica", 10),
     },
     "spacing": {
-        "outer": 14,
-        "section": 16,
-        "gap": 10,
-        "tight": 6,
+        "outer": 0,
+        "section": 14,
+        "gap": 8,
+        "tight": 4,
     },
     "metrics": {
-        "radius_panel": 14,
-        "radius_block": 10,
-        "radius_card": 9,
-        "radius_control": 8,
-        "radius_chip": 8,
-        "radius_device_card": 10,
+        "radius_panel": 18,
+        "radius_block": 16,
+        "radius_card": 16,
+        "radius_control": 14,
+        "radius_chip": 14,
+        "radius_device_card": 18,
+        "width_sidebar": 190,
         "height_shell_panel": 360,
-        "height_device_menu_bar": 46,
-        "height_device_menu_item": 32,
-        "height_chip": 30,
+        "height_device_menu_bar": 44,
+        "height_device_menu_item": 30,
+        "height_chip": 28,
         "height_main_card": 320,
         "height_host_list": 170,
         "height_dropdown": 340,
-        "height_device_card": 214,
+        "height_device_card": 72,
         "height_tile": 70,
         "height_add_device_dialog": 220,
         "height_inventory_panel": 300,
@@ -187,13 +199,13 @@ UI_STYLE_TOKENS = {
         "height_duplicates_view": 170,
         "height_duplicates_editor": 260,
         "height_color_picker": 145,
-        "height_header": 132,
+        "height_header": 88,
         "height_titlebar": 34,
         "height_container_min": 110,
-        "height_button_sm": 32,
-        "height_button_md": 34,
-        "height_button_lg": 36,
-        "control_height": 38,
+        "height_button_sm": 30,
+        "height_button_md": 32,
+        "height_button_lg": 34,
+        "control_height": 36,
     },
     "button_styles": {
         "primary": {
@@ -223,49 +235,11 @@ UI_STYLE_KIT = UI_STYLE_TOKENS["metrics"]
 UI_BUTTON_STYLES = UI_STYLE_TOKENS["button_styles"]
 
 
-@dataclass
-class DeviceRecord:
-    name: str
-    folder: Path
-    config_path: Optional[Path]
-    excel_path: Optional[Path]
-    csv_path: Optional[Path]
-    updated_at: str
-
-
 def analyze_config(input_path: Path, output_path: Path) -> FortigateConfigParser:
     parser = FortigateConfigParser(str(input_path))
     parser.parse_all()
     parser.save_to_excel(str(output_path))
     return parser
-
-
-def get_local_version() -> str:
-    if VERSION_FILE.exists():
-        return VERSION_FILE.read_text(encoding="utf-8").strip()
-    return "0.0.0"
-
-
-def get_display_version() -> str:
-    base = get_local_version().strip()
-    if not base:
-        return "v0.0.0"
-    return base if base.startswith("v") else f"v{base}"
-
-
-def parse_version(version: str) -> tuple:
-    cleaned = version.strip().lstrip("v")
-    parts = []
-    for token in cleaned.split("."):
-        digits = "".join(ch for ch in token if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
-
-
-def is_newer_version(remote_version: str, local_version: str) -> bool:
-    return parse_version(remote_version) > parse_version(local_version)
 
 
 def parse_fortigate_color_code(value: str) -> Optional[int]:
@@ -292,88 +266,6 @@ def sanitize_device_name(raw_name: str) -> str:
     return cleaned[:64]
 
 
-class RoundedScrollbar(tk.Canvas):
-    def __init__(
-        self,
-        parent: tk.Widget,
-        command: Callable[..., None],
-        *,
-        track_color: str,
-        thumb_color: str,
-        thumb_hover_color: str,
-        width: int = 11,
-    ) -> None:
-        super().__init__(parent, width=width, highlightthickness=0, bd=0, bg=track_color, takefocus=0, cursor="arrow")
-        self._command = command
-        self._track_color = track_color
-        self._thumb_color = thumb_color
-        self._thumb_hover_color = thumb_hover_color
-        self._first = 0.0
-        self._last = 1.0
-        self._hover = False
-        self._drag_offset = 0.0
-        self._thumb_top = 0.0
-        self._thumb_bottom = 0.0
-        self._thumb_tag = "thumb"
-        self.bind("<Configure>", lambda _e: self._redraw())
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_press)
-        self.bind("<B1-Motion>", self._on_drag)
-
-    def set(self, first: str, last: str) -> None:
-        self._first = max(0.0, min(1.0, float(first)))
-        self._last = max(self._first, min(1.0, float(last)))
-        self._redraw()
-
-    def _draw_pill(self, x1: float, y1: float, x2: float, y2: float, color: str, tag: str) -> None:
-        radius = max(1.0, min((x2 - x1) / 2, (y2 - y1) / 2))
-        self.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=color, outline=color, tags=(tag,))
-        self.create_oval(x1, y1, x1 + radius * 2, y2, fill=color, outline=color, tags=(tag,))
-        self.create_oval(x2 - radius * 2, y1, x2, y2, fill=color, outline=color, tags=(tag,))
-
-    def _redraw(self) -> None:
-        self.delete("all")
-        w = max(8, self.winfo_width())
-        h = max(20, self.winfo_height())
-        x1, x2 = 2, w - 2
-        self._draw_pill(x1, 1, x2, h - 1, self._track_color, "track")
-        span = max(0.05, self._last - self._first)
-        thumb_h = max(24.0, h * span)
-        y1 = min(h - thumb_h - 1, max(1.0, h * self._first))
-        y2 = y1 + thumb_h
-        self._thumb_top = y1
-        self._thumb_bottom = y2
-        thumb_color = self._thumb_hover_color if self._hover else self._thumb_color
-        self._draw_pill(x1 + 1, y1, x2 - 1, y2, thumb_color, self._thumb_tag)
-
-    def _on_enter(self, _event: tk.Event) -> None:
-        self._hover = True
-        self._redraw()
-
-    def _on_leave(self, _event: tk.Event) -> None:
-        self._hover = False
-        self._redraw()
-
-    def _on_press(self, event: tk.Event) -> None:
-        y = float(getattr(event, "y", 0))
-        if self._thumb_top <= y <= self._thumb_bottom:
-            self._drag_offset = y - self._thumb_top
-            return
-        self._drag_offset = (self._thumb_bottom - self._thumb_top) / 2
-        if y < self._thumb_top:
-            self._command("scroll", -1, "pages")
-        else:
-            self._command("scroll", 1, "pages")
-
-    def _on_drag(self, event: tk.Event) -> None:
-        h = max(20.0, float(self.winfo_height()))
-        size = max(0.05, self._last - self._first)
-        y = float(getattr(event, "y", 0)) - self._drag_offset
-        first = max(0.0, min(1.0 - size, y / h))
-        self._command("moveto", str(first))
-
-
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -384,7 +276,7 @@ class App:
         self._configure_window_chrome()
         self._set_window_icon()
 
-        self.local_version = get_display_version()
+        self.local_version = get_display_version(VERSION_FILE)
         self.status_var = tk.StringVar(value="Добавьте устройство, чтобы начать анализ.")
         self.devices: Dict[str, DeviceRecord] = {}
         self.selected_device_name: Optional[str] = None
@@ -571,7 +463,7 @@ class App:
         style.configure(
             "App.TButton",
             font=UI_FONTS["action_bold"],
-            padding=(12, 9),
+            padding=(12, 8),
             foreground=UI_COLORS["button_app_fg"],
             background=UI_COLORS["button_app_bg"],
             borderwidth=0,
@@ -585,37 +477,22 @@ class App:
         style.configure(
             "Danger.TButton",
             font=UI_FONTS["action_bold"],
-            padding=(12, 9),
+            padding=(12, 8),
             foreground=UI_COLORS["button_danger_fg"],
             background=UI_COLORS["button_danger_bg"],
             borderwidth=0,
             focusthickness=0,
         )
         style.map("Danger.TButton", background=[("active", UI_COLORS["button_danger_bg_active"]), ("pressed", UI_COLORS["button_danger_bg_pressed"])])
-        style.configure("Rounded.TEntry", fieldbackground=UI_COLORS["entry_light"], borderwidth=0, relief="flat", padding=(8, 7))
-        style.configure("Card.TFrame", background=UI_COLORS["panel"], borderwidth=1, relief="solid")
-        style.configure("Ghost.TButton", font=UI_FONTS["label_sm_bold"], padding=(10, 6), foreground=UI_COLORS["muted"])
-        style.configure(
-            "Vault.Vertical.TScrollbar",
-            troughcolor=UI_COLORS["scrollbar_track"],
-            background=UI_COLORS["scrollbar_thumb"],
-            bordercolor=UI_COLORS["scrollbar_track"],
-            arrowcolor=UI_COLORS["scrollbar_track"],
-            darkcolor=UI_COLORS["scrollbar_thumb"],
-            lightcolor=UI_COLORS["scrollbar_thumb"],
-            gripcount=0,
-            relief="flat",
-            borderwidth=0,
-            arrowsize=8,
-            width=9,
-        )
-        style.map("Vault.Vertical.TScrollbar", background=[("active", UI_COLORS["scrollbar_thumb_active"]), ("pressed", UI_COLORS["scrollbar_thumb_active"])])
+        style.configure("Rounded.TEntry", fieldbackground=UI_COLORS["entry_light"], borderwidth=0, relief="flat", padding=(8, 6))
+        style.configure("Card.TFrame", background=UI_COLORS["panel"], borderwidth=0, relief="flat")
+        style.configure("Ghost.TButton", font=UI_FONTS["label_sm_bold"], padding=(10, 5), foreground=UI_COLORS["muted"])
         style.configure(
             "Vault.TCombobox",
             fieldbackground=UI_COLORS["panel"],
             background=UI_COLORS["panel"],
             foreground=UI_COLORS["text"],
-            arrowcolor=UI_COLORS["text"],
+            arrowcolor=UI_COLORS["muted"],
             bordercolor=UI_COLORS["line"],
             lightcolor=UI_COLORS["line"],
             darkcolor=UI_COLORS["line"],
@@ -637,7 +514,7 @@ class App:
                 outer_bg=UI_COLORS["bg"],
                 fill_color=UI_COLORS["panel_shadow"],
                 border_color=UI_COLORS["line_soft"],
-                radius=22,
+                radius=28,
                 border_width=1,
                 min_height=UI_STYLE_KIT["height_shell_panel"],
             )
@@ -650,70 +527,35 @@ class App:
         self._build_custom_titlebar()
         self._build_header()
 
-        shell = tk.Frame(self.ui_root, bg=UI_COLORS["bg"])
-        shell.pack(fill="both", expand=True, padx=UI_SPACING["outer"], pady=(UI_SPACING["gap"], UI_SPACING["outer"]))
+        # Main body: sidebar + content area (Termius-style flat layout)
+        body = tk.Frame(self.ui_root, bg=UI_COLORS["bg"])
+        body.pack(fill="both", expand=True)
 
-        left_canvas, left = self._create_rounded_container(
-            shell,
-            outer_bg=UI_COLORS["bg"],
-            fill_color=UI_COLORS["panel"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_panel"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_shell_panel"],
-        )
-        left_canvas.configure(width=210)
-        left_canvas.pack(side="left", fill="y")
-        self._build_left_panel(left)
+        # Sidebar — fixed width, darker background
+        sidebar = tk.Frame(body, bg=UI_COLORS["sidebar"], width=UI_STYLE_KIT["width_sidebar"])
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        self._build_left_panel(sidebar)
 
-        center_canvas, center = self._create_rounded_container(
-            shell,
-            outer_bg=UI_COLORS["bg"],
-            fill_color=UI_COLORS["panel_soft"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_panel"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_shell_panel"],
-        )
-        center_canvas.pack(side="left", fill="both", expand=True, padx=UI_SPACING["outer"])
+        # Thin vertical divider
+        tk.Frame(body, bg=UI_COLORS["line"], width=1).pack(side="left", fill="y")
+
+        # Content area: center + right
+        content = tk.Frame(body, bg=UI_COLORS["bg"])
+        content.pack(side="left", fill="both", expand=True)
+
+        center = tk.Frame(content, bg=UI_COLORS["panel_soft"])
+        center.pack(side="left", fill="both", expand=True)
         self._build_center_panel(center)
 
-        right_canvas, right = self._create_rounded_container(
-            shell,
-            outer_bg=UI_COLORS["bg"],
-            fill_color=UI_COLORS["panel"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_panel"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_shell_panel"],
-        )
-        right_canvas.configure(width=360)
-        self.right_panel_canvas = right_canvas
-        self._build_right_panel(right)
+        # Thin vertical divider before right panel
+        tk.Frame(content, bg=UI_COLORS["line"], width=1).pack(side="left", fill="y")
 
-        footer = tk.Frame(self.ui_root, bg=UI_COLORS["bg"])
-        footer.pack(fill="x", padx=UI_SPACING["outer"], pady=(0, UI_SPACING["tight"]))
-        footer_right = tk.Frame(footer, bg=UI_COLORS["bg"])
-        footer_right.pack(side="right")
-        tk.Label(
-            footer_right,
-            text=f"Версия {self.local_version}  |  ",
-            anchor="w",
-            bg=UI_COLORS["bg"],
-            fg=UI_COLORS["muted"],
-        ).pack(side="left")
-        clickable_style = {
-            "bg": UI_COLORS["bg"],
-            "fg": UI_COLORS["muted"],
-            "font": UI_FONTS["label_sm"],
-        }
-        copyright_link = tk.Label(footer_right, text="© Mr-DrSwan", **clickable_style)
-        copyright_link.pack(side="left")
-        tk.Label(footer_right, text="  ·  ", bg=UI_COLORS["bg"], fg=UI_COLORS["muted"]).pack(side="left")
-        github_link = tk.Label(footer_right, text="GitHub", **clickable_style)
-        github_link.pack(side="left")
-        for widget in (copyright_link, github_link):
-            widget.bind("<Button-1>", self._open_github_profile)
+        right = tk.Frame(content, bg=UI_COLORS["panel"], width=340)
+        right.pack(side="left", fill="y")
+        right.pack_propagate(False)
+        self.right_panel_canvas = None
+        self._build_right_panel(right)
 
     def _build_custom_titlebar(self) -> None:
         if not self.show_custom_titlebar:
@@ -821,69 +663,61 @@ class App:
         for child in self.open_tabs_frame.winfo_children():
             child.destroy()
 
+        BG = UI_COLORS["bg"]
+
+        def _make_tab(parent: tk.Frame, text: str, is_active: bool, on_click, on_close=None) -> None:
+            tab_bg = UI_COLORS["sidebar_item_active"] if is_active else BG
+            border_col = UI_COLORS["line_soft"] if is_active else UI_COLORS["line"]
+
+            tab_canvas, tab_inner = self._create_rounded_container(
+                parent,
+                outer_bg=BG,
+                fill_color=tab_bg,
+                border_color=border_col,
+                radius=UI_STYLE_KIT["radius_control"],
+                border_width=1,
+                min_height=UI_STYLE_KIT["height_device_menu_item"],
+            )
+            tab_canvas.pack(side="left", padx=(0, 6))
+
+            row = tk.Frame(tab_inner, bg=tab_bg)
+            row.pack(fill="both", expand=True, padx=8)
+
+            lbl = tk.Label(
+                row,
+                text=text,
+                bg=tab_bg,
+                fg=UI_COLORS["text"] if is_active else UI_COLORS["muted"],
+                font=UI_FONTS["label_sm_bold"],
+            )
+            lbl.pack(side="left")
+
+            if on_close:
+                close = tk.Label(
+                    row,
+                    text=" ×",
+                    bg=tab_bg,
+                    fg=UI_COLORS["muted"],
+                    font=UI_FONTS["label_sm_bold"],
+                )
+                close.pack(side="left")
+                close.bind("<Button-1>", lambda _e: on_close())
+
+            for w in (tab_canvas, tab_inner, row, lbl):
+                w.bind("<Button-1>", lambda _e, fn=on_click: fn())
+
         menu_active = self.active_device_tab is None
-        menu_canvas, menu_inner = self._create_rounded_container(
-            self.open_tabs_frame,
-            outer_bg=UI_COLORS["panel"],
-            fill_color=UI_COLORS["panel_soft"],
-            border_color=UI_COLORS["accent"] if menu_active else UI_COLORS["line"],
-            radius=UI_STYLE_KIT["radius_control"],
-            border_width=2 if menu_active else 1,
-            min_height=UI_STYLE_KIT["height_device_menu_item"],
-        )
-        menu_canvas.configure(width=120)
-        menu_canvas.pack(side="left", padx=(0, 8), pady=(0, 2))
-        menu_label = tk.Label(
-            menu_inner,
-            text="MENU",
-            bg=UI_COLORS["panel_soft"],
-            fg=UI_COLORS["text"] if menu_active else UI_COLORS["muted"],
-            font=UI_FONTS["label_sm_bold"],
-        )
-        menu_label.pack(fill="both", expand=True)
-        menu_label.bind("<Button-1>", lambda _e: self._activate_menu_tab())
+        _make_tab(self.open_tabs_frame, "Устройства", menu_active, self._activate_menu_tab)
 
         for device_name in self.opened_devices:
             is_active = device_name == self.active_device_tab
-            tab_canvas, tab_inner = self._create_rounded_container(
+            _make_tab(
                 self.open_tabs_frame,
-                outer_bg=UI_COLORS["panel"],
-                fill_color=UI_COLORS["panel_soft"],
-                border_color=UI_COLORS["accent"] if is_active else UI_COLORS["line"],
-                radius=UI_STYLE_KIT["radius_control"],
-                border_width=2 if is_active else 1,
-                min_height=UI_STYLE_KIT["height_device_menu_item"],
+                device_name,
+                is_active,
+                on_click=lambda n=device_name: self._activate_device_tab(n),
+                on_close=lambda n=device_name: self._close_open_tab(n),
             )
-            tab_canvas.pack(side="left", padx=(0, 8), pady=(0, 2))
-            tab_canvas.configure(width=170)
-            title = tk.Label(
-                tab_inner,
-                text=device_name,
-                bg=UI_COLORS["panel_soft"],
-                fg=UI_COLORS["text"],
-                font=UI_FONTS["label_sm_bold"],
-                anchor="w",
-            )
-            title.pack(side="left", fill="x", expand=True, padx=(8, 4))
-            close_btn = tk.Label(
-                tab_inner,
-                text="x",
-                bg=UI_COLORS["panel_soft"],
-                fg=UI_COLORS["muted"],
-                font=UI_FONTS["label_sm_bold"],
-            )
-            close_btn.pack(side="right", padx=(0, 8))
-            title.bind("<Button-1>", lambda _e, n=device_name: self._activate_device_tab(n))
-            close_btn.bind("<Button-1>", lambda _e, n=device_name: self._close_open_tab(n))
-
-        if not self.opened_devices:
-            tk.Label(
-                self.open_tabs_frame,
-                text="Нет открытых устройств",
-                bg=UI_COLORS["panel"],
-                fg=UI_COLORS["muted"],
-                font=UI_FONTS["label_sm"],
-            ).pack(side="left", padx=(6, 0))
 
     def _activate_menu_tab(self) -> None:
         self.active_device_tab = None
@@ -928,7 +762,10 @@ class App:
             self.device_page_canvas.pack_forget()
         if self.editor_canvas is not None and self.editor_canvas.winfo_manager():
             self.editor_canvas.pack_forget()
-        if self.cards_wrap_canvas is not None and not self.cards_wrap_canvas.winfo_manager():
+        if hasattr(self, "cards_outer_frame") and self.cards_outer_frame is not None:
+            if not self.cards_outer_frame.winfo_manager():
+                self.cards_outer_frame.pack(fill="both", expand=True)
+        elif self.cards_wrap_canvas is not None and not self.cards_wrap_canvas.winfo_manager():
             self.cards_wrap_canvas.pack(fill="both", expand=True, padx=UI_SPACING["section"], pady=(0, UI_SPACING["section"]))
         self.editor_target_path = None
         self.editor_title_var.set("Встроенный редактор")
@@ -949,7 +786,9 @@ class App:
             if not target.exists():
                 target.write_text("", encoding="utf-8")
 
-        if self.cards_wrap_canvas is not None and self.cards_wrap_canvas.winfo_manager():
+        if hasattr(self, "cards_outer_frame") and self.cards_outer_frame is not None and self.cards_outer_frame.winfo_manager():
+            self.cards_outer_frame.pack_forget()
+        elif self.cards_wrap_canvas is not None and self.cards_wrap_canvas.winfo_manager():
             self.cards_wrap_canvas.pack_forget()
         if self.device_page_canvas is not None and self.device_page_canvas.winfo_manager():
             self.device_page_canvas.pack_forget()
@@ -983,7 +822,9 @@ class App:
         self.active_editor_device = None
         self._show_right_panel()
 
-        if self.cards_wrap_canvas is not None and self.cards_wrap_canvas.winfo_manager():
+        if hasattr(self, "cards_outer_frame") and self.cards_outer_frame is not None and self.cards_outer_frame.winfo_manager():
+            self.cards_outer_frame.pack_forget()
+        elif self.cards_wrap_canvas is not None and self.cards_wrap_canvas.winfo_manager():
             self.cards_wrap_canvas.pack_forget()
         if self.editor_canvas is not None and self.editor_canvas.winfo_manager():
             self.editor_canvas.pack_forget()
@@ -1631,56 +1472,24 @@ class App:
         self.status_var.set(f"Файл сохранен: {self.editor_target_path.name}")
 
     def _build_header(self) -> None:
-        header_canvas, header = self._create_rounded_container(
-            self.ui_root,
-            outer_bg=UI_COLORS["bg"],
-            fill_color=UI_COLORS["panel"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_block"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_header"],
-        )
-        top_pad = UI_SPACING["gap"]
-        header_canvas.pack(fill="x", padx=UI_SPACING["outer"], pady=(top_pad, 0))
+        BG = UI_COLORS["bg"]
 
-        top_row = tk.Frame(header, bg=UI_COLORS["panel"])
-        top_row.pack(fill="x", padx=10, pady=(8, 4))
+        # Top bar: search + toolbar chips (Termius-style, compact, no Panel wrapper)
+        topbar = tk.Frame(self.ui_root, bg=BG)
+        topbar.pack(fill="x", padx=14, pady=(10, 0))
 
-        left = tk.Frame(top_row, bg=UI_COLORS["panel"])
-        left.pack(side="left", fill="y")
-
-        if hasattr(self, "_header_icon_ref"):
-            tk.Label(left, image=self._header_icon_ref, bg=UI_COLORS["panel"]).pack(side="left", padx=(16, 10))
-        elif hasattr(self, "_small_icon_ref"):
-            tk.Label(left, image=self._small_icon_ref, bg=UI_COLORS["panel"]).pack(side="left", padx=(16, 10))
-
-        title_wrap = tk.Frame(left, bg=UI_COLORS["panel"])
-        title_wrap.pack(side="left", fill="y")
-        tk.Label(
-            title_wrap,
-            text="Forti Analyzer",
-            bg=UI_COLORS["panel"],
-            fg=UI_COLORS["text"],
-            font=UI_FONTS["title_xl_bold"],
-        ).pack(anchor="w", pady=(4, 0))
-        tk.Label(
-            title_wrap,
-            text="Device Vault",
-            bg=UI_COLORS["panel"],
-            fg=UI_COLORS["muted"],
-            font=UI_FONTS["label_md"],
-        ).pack(anchor="w")
-
-        search_shell, search_inner = self._create_rounded_container(
-            top_row,
-            outer_bg=UI_COLORS["panel"],
+        # Search field — rounded container
+        search_canvas, search_inner = self._create_rounded_container(
+            topbar,
+            outer_bg=BG,
             fill_color=UI_COLORS["panel_soft"],
             border_color=UI_COLORS["line"],
             radius=UI_STYLE_KIT["radius_control"],
             border_width=1,
             min_height=UI_STYLE_KIT["height_button_lg"],
         )
-        search_shell.pack(side="left", fill="x", expand=True, padx=(14, 12), pady=(2, 0))
+        search_canvas.pack(side="left", fill="x", expand=True)
+
         search_entry = tk.Entry(
             search_inner,
             textvariable=self.host_search_var,
@@ -1689,9 +1498,10 @@ class App:
             bg=UI_COLORS["panel_soft"],
             fg=UI_COLORS["text"],
             insertbackground=UI_COLORS["text"],
+            font=UI_FONTS["label_md"],
         )
         search_entry.insert(0, "Find a host or device...")
-        search_entry.pack(fill="both", expand=True, padx=10, pady=4)
+        search_entry.pack(fill="both", expand=True, padx=10, pady=5)
 
         def _clear_placeholder(_event) -> None:
             if search_entry.get() == "Find a host or device...":
@@ -1704,135 +1514,315 @@ class App:
         search_entry.bind("<FocusIn>", _clear_placeholder)
         search_entry.bind("<FocusOut>", _restore_placeholder)
 
-        toolbar = tk.Frame(top_row, bg=UI_COLORS["panel"])
-        toolbar.pack(side="right", padx=(0, 6))
-        for item in ("GRID", "SEARCH", "FILTER"):
+        # Toolbar chips — rounded containers
+        toolbar = tk.Frame(topbar, bg=BG)
+        toolbar.pack(side="right", padx=(10, 0))
+
+        def _make_chip(parent: tk.Frame, text: str) -> None:
             chip_canvas, chip_inner = self._create_rounded_container(
-                toolbar,
-                outer_bg=UI_COLORS["panel"],
+                parent,
+                outer_bg=BG,
                 fill_color=UI_COLORS["panel_soft"],
                 border_color=UI_COLORS["line"],
                 radius=UI_STYLE_KIT["radius_chip"],
                 border_width=1,
                 min_height=UI_STYLE_KIT["height_chip"],
             )
-            chip_canvas.configure(width=84)
-            chip_canvas.pack(side="left", padx=(0, 8), pady=8)
-            chip = tk.Label(
+            chip_canvas.configure(width=76)
+            chip_canvas.pack(side="left", padx=(0, 6))
+            chip_lbl = tk.Label(
                 chip_inner,
-                text=item,
+                text=text,
                 bg=UI_COLORS["panel_soft"],
                 fg=UI_COLORS["muted"],
                 font=UI_FONTS["label_sm_bold"],
             )
-            chip.pack(fill="both", expand=True)
+            chip_lbl.pack(fill="both", expand=True)
 
-            def on_enter(_event, c=chip_canvas, l=chip) -> None:
+            def _enter(_e, c=chip_canvas, l=chip_lbl) -> None:
                 c._rounded_fill = UI_COLORS["chip_hover"]  # type: ignore[attr-defined]
-                self._set_rounded_style(c, UI_COLORS["accent_soft"], 1)
+                self._set_rounded_style(c, UI_COLORS["line_soft"], 1)
                 l.configure(bg=UI_COLORS["chip_hover"], fg=UI_COLORS["text"])
 
-            def on_leave(_event, c=chip_canvas, l=chip) -> None:
+            def _leave(_e, c=chip_canvas, l=chip_lbl) -> None:
                 c._rounded_fill = UI_COLORS["panel_soft"]  # type: ignore[attr-defined]
                 self._set_rounded_style(c, UI_COLORS["line"], 1)
                 l.configure(bg=UI_COLORS["panel_soft"], fg=UI_COLORS["muted"])
 
-            for widget in (chip_canvas, chip_inner, chip):
-                widget.bind("<Enter>", on_enter)
-                widget.bind("<Leave>", on_leave)
+            for w in (chip_canvas, chip_inner, chip_lbl):
+                w.bind("<Enter>", _enter)
+                w.bind("<Leave>", _leave)
 
-        tabs_row = tk.Frame(header, bg=UI_COLORS["panel"])
-        tabs_row.pack(fill="x", padx=10, pady=(2, 8))
-        self.open_tabs_frame = tk.Frame(tabs_row, bg=UI_COLORS["panel"])
+        for chip_text in ("⊞ Grid", "⌕ Filter"):
+            _make_chip(toolbar, chip_text)
+
+        # Horizontal divider
+        tk.Frame(self.ui_root, bg=UI_COLORS["line"], height=1).pack(fill="x", pady=(8, 0))
+
+        # Tabs row — opened devices
+        tabs_bar = tk.Frame(self.ui_root, bg=BG)
+        tabs_bar.pack(fill="x", padx=14, pady=(4, 0))
+
+        self.open_tabs_frame = tk.Frame(tabs_bar, bg=BG)
         self.open_tabs_frame.pack(side="left", fill="x", expand=True)
         self._refresh_open_tabs()
 
-        right = tk.Frame(tabs_row, bg=UI_COLORS["panel"])
-        right.pack(side="right", padx=(10, 0))
-        tk.Label(
-            right,
-            text="Opened devices",
-            bg=UI_COLORS["panel"],
-            fg=UI_COLORS["muted"],
-            font=UI_FONTS["label_sm_bold"],
-        ).pack(side="right")
+        # Horizontal divider under tabs
+        tk.Frame(self.ui_root, bg=UI_COLORS["line"], height=1).pack(fill="x", pady=(4, 0))
 
     def _build_left_panel(self, panel: tk.Frame) -> None:
-        logo = tk.Frame(panel, bg=UI_COLORS["panel"])
-        logo.pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["gap"]))
+        S = UI_COLORS["sidebar"]
+
+        # --- Logo block ---
+        logo_block = tk.Frame(panel, bg=S)
+        logo_block.pack(fill="x", padx=14, pady=(18, 14))
+
+        logo_icon = self._create_icon_badge(logo_block, "FW", UI_COLORS["accent"], size=40, radius=14)
+        logo_icon.pack(side="left")
+
+        logo_text = tk.Frame(logo_block, bg=S)
+        logo_text.pack(side="left", padx=(10, 0))
         tk.Label(
-            logo,
-            text="Actions",
-            bg=UI_COLORS["panel"],
+            logo_text,
+            text="FortiAnalyzer",
+            bg=S,
+            fg=UI_COLORS["text"],
+            font=UI_FONTS["sidebar_logo"],
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            logo_text,
+            text="Device Vault",
+            bg=S,
             fg=UI_COLORS["muted"],
-            font=UI_FONTS["action_bold"],
+            font=UI_FONTS["sidebar_logo_sub"],
+            anchor="w",
         ).pack(anchor="w")
 
-        self._create_round_button(panel, "+  Добавить устройство", self.open_add_device_dialog).pack(
-            fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["gap"])
-        )
-        self._create_round_button(panel, "o  Обновить список", self._load_devices).pack(
-            fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["gap"])
-        )
-        self._create_round_button(panel, ">  Добавить адреса", self.open_address_transfer_dialog).pack(
-            fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["gap"])
-        )
-        self._create_round_button(panel, "[]  Страница устройства", self._open_selected_device_page).pack(
-            fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["gap"])
-        )
-        self._create_round_button(panel, "^  Проверка обновлений", self.check_for_updates).pack(
-            fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["gap"])
-        )
+        # --- Divider ---
+        tk.Frame(panel, bg=UI_COLORS["line"], height=1).pack(fill="x", padx=10)
 
+        # --- Navigation items ---
+        nav_frame = tk.Frame(panel, bg=S)
+        nav_frame.pack(fill="x", pady=(8, 0))
+
+        # nav_item_data: (icon, label, cmd)
+        nav_items = [
+            ("▦", "Устройства",  self._show_cards_view),
+            ("◎", "Адреса",      self._show_addresses_for_selected_device),
+            ("⊛", "Дубликаты",   self._show_address_duplicates_for_selected_device),
+            ("⊕", "Группы",      self._open_group_sorting_for_selected_device),
+            ("⇄", "Перенос",     self._open_transfer_direction_for_selected_device),
+        ]
+
+        self._sidebar_item_frames: list = []
+        self._active_nav_item: Optional[tk.Frame] = None
+
+        def _make_nav_item(parent: tk.Frame, icon: str, label: str, cmd, is_primary: bool = True) -> tk.Frame:
+            item = tk.Frame(parent, bg=S, cursor="hand2", height=38)
+            item.pack(fill="x")
+            item.pack_propagate(False)
+
+            # Active left-border indicator
+            indicator = tk.Frame(item, bg=S, width=3)
+            indicator.pack(side="left", fill="y")
+
+            row = tk.Frame(item, bg=S)
+            row.pack(side="left", fill="both", expand=True, padx=(12, 8))
+
+            icon_lbl = tk.Label(
+                row,
+                text=icon,
+                bg=S,
+                fg=UI_COLORS["muted"],
+                font=UI_FONTS["label_md"],
+                width=2,
+                anchor="center",
+            )
+            icon_lbl.pack(side="left")
+
+            text_lbl = tk.Label(
+                row,
+                text=label,
+                bg=S,
+                fg=UI_COLORS["muted"],
+                font=UI_FONTS["sidebar_item"],
+                anchor="w",
+            )
+            text_lbl.pack(side="left", padx=(6, 0))
+
+            def _activate(f=item, ind=indicator, il=icon_lbl, tl=text_lbl) -> None:
+                if self._active_nav_item and self._active_nav_item is not f:
+                    prev = self._active_nav_item
+                    prev_ind = prev.winfo_children()[0]
+                    prev_row = prev.winfo_children()[1] if len(prev.winfo_children()) > 1 else None
+                    prev.configure(bg=S)
+                    prev_ind.configure(bg=S)
+                    if prev_row:
+                        for w in prev_row.winfo_children():
+                            w.configure(bg=S, fg=UI_COLORS["muted"])
+                self._active_nav_item = f
+                f.configure(bg=UI_COLORS["sidebar_item_active"])
+                ind.configure(bg=UI_COLORS["accent"])
+                row.configure(bg=UI_COLORS["sidebar_item_active"])
+                il.configure(bg=UI_COLORS["sidebar_item_active"], fg=UI_COLORS["text"])
+                tl.configure(bg=UI_COLORS["sidebar_item_active"], fg=UI_COLORS["text"])
+
+            def _on_enter(_e, f=item, ind=indicator, r=row, il=icon_lbl, tl=text_lbl) -> None:
+                if self._active_nav_item is not f:
+                    f.configure(bg=UI_COLORS["sidebar_item_hover"])
+                    r.configure(bg=UI_COLORS["sidebar_item_hover"])
+                    il.configure(bg=UI_COLORS["sidebar_item_hover"], fg=UI_COLORS["sidebar_text_active"])
+                    tl.configure(bg=UI_COLORS["sidebar_item_hover"], fg=UI_COLORS["sidebar_text_active"])
+
+            def _on_leave(_e, f=item, ind=indicator, r=row, il=icon_lbl, tl=text_lbl) -> None:
+                if self._active_nav_item is not f:
+                    f.configure(bg=S)
+                    r.configure(bg=S)
+                    il.configure(bg=S, fg=UI_COLORS["muted"])
+                    tl.configure(bg=S, fg=UI_COLORS["muted"])
+
+            def _on_click(_e, c=cmd, act=_activate) -> None:
+                act()
+                c()
+
+            for w in (item, row, icon_lbl, text_lbl):
+                w.bind("<Enter>", _on_enter)
+                w.bind("<Leave>", _on_leave)
+                w.bind("<Button-1>", _on_click)
+
+            return item
+
+        for icon, label, cmd in nav_items:
+            nav_item = _make_nav_item(nav_frame, icon, label, cmd)
+            self._sidebar_item_frames.append(nav_item)
+
+        # Activate first item by default
+        if self._sidebar_item_frames:
+            first = self._sidebar_item_frames[0]
+            self._active_nav_item = first
+            first.configure(bg=UI_COLORS["sidebar_item_active"])
+            children = first.winfo_children()
+            if children:
+                children[0].configure(bg=UI_COLORS["accent"])  # indicator
+            if len(children) > 1:
+                for w in children[1].winfo_children():
+                    w.configure(bg=UI_COLORS["sidebar_item_active"], fg=UI_COLORS["text"])
+
+        # --- Divider ---
+        tk.Frame(panel, bg=UI_COLORS["line"], height=1).pack(fill="x", padx=10, pady=(8, 0))
+
+        # --- Secondary nav ---
+        secondary_frame = tk.Frame(panel, bg=S)
+        secondary_frame.pack(fill="x", pady=(4, 0))
+
+        secondary_items = [
+            ("↑", "Обновления",  self.check_for_updates),
+            ("↻", "Обновить",    self._load_devices),
+        ]
+        for icon, label, cmd in secondary_items:
+            _make_nav_item(secondary_frame, icon, label, cmd, is_primary=False)
+
+        # --- Add device button at bottom ---
+        bottom = tk.Frame(panel, bg=S)
+        bottom.pack(side="bottom", fill="x", padx=12, pady=14)
+
+        add_canvas, add_inner = self._create_rounded_container(
+            bottom,
+            outer_bg=S,
+            fill_color=UI_COLORS["accent"],
+            border_color=UI_COLORS["accent"],
+            radius=UI_STYLE_KIT["radius_control"],
+            border_width=0,
+            min_height=UI_STYLE_KIT["height_button_md"],
+        )
+        add_canvas.pack(fill="x")
+        add_lbl = tk.Label(
+            add_inner,
+            text="+ Добавить устройство",
+            bg=UI_COLORS["accent"],
+            fg="#FFFFFF",
+            font=UI_FONTS["sidebar_item_bold"],
+            cursor="hand2",
+        )
+        add_lbl.pack(fill="both", expand=True)
+
+        def _add_hover(_e) -> None:
+            add_canvas._rounded_fill = UI_COLORS["accent_hover"]  # type: ignore[attr-defined]
+            self._set_rounded_style(add_canvas, UI_COLORS["accent_hover"], 0)
+            add_lbl.configure(bg=UI_COLORS["accent_hover"])
+            add_inner.configure(bg=UI_COLORS["accent_hover"])
+
+        def _add_leave(_e) -> None:
+            add_canvas._rounded_fill = UI_COLORS["accent"]  # type: ignore[attr-defined]
+            self._set_rounded_style(add_canvas, UI_COLORS["accent"], 0)
+            add_lbl.configure(bg=UI_COLORS["accent"])
+            add_inner.configure(bg=UI_COLORS["accent"])
+
+        for w in (add_canvas, add_inner, add_lbl):
+            w.bind("<Enter>", _add_hover)
+            w.bind("<Leave>", _add_leave)
+            w.bind("<Button-1>", lambda _e: self.open_add_device_dialog())
+
+        # --- Version label ---
         tk.Label(
-            panel,
-            text="Configs and reports are saved\ninside the local devices vault.",
-            justify="left",
-            bg=UI_COLORS["panel"],
+            bottom,
+            text=f"{self.local_version}",
+            bg=S,
             fg=UI_COLORS["muted"],
-            font=UI_FONTS["label_sm"],
-        ).pack(anchor="w", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], 0))
+            font=UI_FONTS["label_xs"],
+        ).pack(pady=(8, 0))
 
     def _build_center_panel(self, panel: tk.Frame) -> None:
-        header = tk.Frame(panel, bg=UI_COLORS["panel_soft"])
-        header.pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["gap"]))
+        PS = UI_COLORS["panel_soft"]
+
+        # Section toolbar — Termius-style
+        toolbar = tk.Frame(panel, bg=PS)
+        toolbar.pack(fill="x", padx=14, pady=(12, 8))
+
         tk.Label(
-            header,
-            text="Добавленные устройства",
-            bg=UI_COLORS["panel_soft"],
+            toolbar,
+            text="Устройства",
+            bg=PS,
             fg=UI_COLORS["text"],
-            font=UI_FONTS["title_lg_bold"],
-        ).pack(anchor="w")
+            font=UI_FONTS["title_md_bold"],
+        ).pack(side="left")
+
         tk.Label(
-            header,
+            toolbar,
             textvariable=self.status_var,
-            bg=UI_COLORS["panel_soft"],
+            bg=PS,
             fg=UI_COLORS["muted"],
-            justify="left",
-        ).pack(anchor="w", pady=(4, 0))
+            font=UI_FONTS["label_sm"],
+        ).pack(side="left", padx=(10, 0))
 
-        self.cards_wrap_canvas, cards_wrap = self._create_rounded_container(
-            panel,
-            outer_bg=UI_COLORS["panel_soft"],
-            fill_color=UI_COLORS["panel_soft"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_block"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_main_card"],
-        )
-        self.cards_wrap_canvas.pack(fill="both", expand=True, padx=UI_SPACING["section"], pady=(0, UI_SPACING["section"]))
+        self._create_round_button(
+            toolbar,
+            "+ Новое",
+            self.open_add_device_dialog,
+            min_height=UI_STYLE_KIT["height_button_sm"],
+        ).pack(side="right")
 
-        canvas = tk.Canvas(cards_wrap, bg=UI_COLORS["panel_soft"], highlightthickness=0)
-        scroll = self._create_scrollbar(cards_wrap, canvas.yview)
-        frame = tk.Frame(canvas, bg=UI_COLORS["panel_soft"])
+        # Divider under toolbar
+        tk.Frame(panel, bg=UI_COLORS["line"], height=1).pack(fill="x")
+
+        # Scrollable cards area — flat, no wrapper container
+        cards_outer = tk.Frame(panel, bg=PS)
+        cards_outer.pack(fill="both", expand=True)
+        self.cards_outer_frame = cards_outer
+
+        canvas = tk.Canvas(cards_outer, bg=PS, highlightthickness=0)
+        scroll = self._create_scrollbar(cards_outer, canvas.yview)
+        frame = tk.Frame(canvas, bg=PS)
         frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=frame, anchor="nw")
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        self._bind_vertical_mousewheel(canvas, canvas, frame, cards_wrap)
+        self._bind_vertical_mousewheel(canvas, canvas, frame, cards_outer)
         self.cards_canvas = canvas
         self.cards_frame = frame
+        self.cards_wrap_canvas = None
 
         self.editor_canvas, editor_wrap = self._create_rounded_container(
             panel,
@@ -1934,6 +1924,7 @@ class App:
         actions = tk.Frame(device_page_content, bg=UI_COLORS["panel_soft"])
         actions.pack(fill="x", pady=(4, UI_SPACING["section"]))
         self._create_round_button(actions, "Добавить/заменить конфиг", self.attach_config_to_selected_device).pack(fill="x", pady=(0, 6))
+        self._create_round_button(actions, "Добавить адреса", self._open_transfer_direction_for_selected_device).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Посмотреть адреса", self._show_addresses_for_selected_device).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Сортировка по группам", self._open_group_sorting_for_selected_device).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Найти дубликаты", self._show_address_duplicates_for_selected_device).pack(fill="x", pady=(0, 6))
@@ -1943,9 +1934,11 @@ class App:
         self.device_page_canvas.pack_forget()
 
     def _build_right_panel(self, panel: tk.Frame) -> None:
-        panel_scroll_canvas = tk.Canvas(panel, bg=UI_COLORS["panel"], highlightthickness=0)
+        P = UI_COLORS["panel"]
+
+        panel_scroll_canvas = tk.Canvas(panel, bg=P, highlightthickness=0)
         panel_scroll = self._create_scrollbar(panel, panel_scroll_canvas.yview)
-        panel_content = tk.Frame(panel_scroll_canvas, bg=UI_COLORS["panel"])
+        panel_content = tk.Frame(panel_scroll_canvas, bg=P)
         panel_window = panel_scroll_canvas.create_window((0, 0), window=panel_content, anchor="nw")
         panel_content.bind("<Configure>", lambda _event: panel_scroll_canvas.configure(scrollregion=panel_scroll_canvas.bbox("all")))
         panel_scroll_canvas.bind("<Configure>", lambda event: panel_scroll_canvas.itemconfigure(panel_window, width=event.width))
@@ -1954,39 +1947,34 @@ class App:
         panel_scroll.pack(side="right", fill="y")
         self._bind_vertical_mousewheel(panel_scroll_canvas, panel_scroll_canvas, panel_content)
 
-        title_row = tk.Frame(panel_content, bg=UI_COLORS["panel"])
-        title_row.pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["gap"]))
+        # Section header
+        title_row = tk.Frame(panel_content, bg=P)
+        title_row.pack(fill="x", padx=14, pady=(14, 10))
         tk.Label(
             title_row,
             text="Host Details",
-            bg=UI_COLORS["panel"],
+            bg=P,
             fg=UI_COLORS["text"],
             font=UI_FONTS["title_md_bold"],
         ).pack(side="left")
-        tk.Label(
-            title_row,
-            text="Закрыть",
-            bg=UI_COLORS["panel"],
-            fg=UI_COLORS["muted"],
-            font=UI_FONTS["label_sm_bold"],
-        ).pack(side="right")
-        title_row.winfo_children()[-1].bind("<Button-1>", lambda _e: self._hide_right_panel())
 
-        list_wrap = tk.Frame(panel_content, bg=UI_COLORS["panel"])
-        list_wrap.pack(fill="x", padx=UI_SPACING["section"])
-        hosts_wrap_canvas, hosts_wrap = self._create_rounded_container(
-            list_wrap,
-            outer_bg=UI_COLORS["panel"],
-            fill_color=UI_COLORS["panel_soft"],
-            border_color=UI_COLORS["line_soft"],
-            radius=UI_STYLE_KIT["radius_card"],
-            border_width=1,
-            min_height=UI_STYLE_KIT["height_transfer_color_map"],
-        )
-        hosts_wrap_canvas.pack(fill="x")
-        hosts_canvas = tk.Canvas(hosts_wrap, height=160, bg=UI_COLORS["panel_soft"], highlightthickness=0)
-        hosts_scroll = self._create_scrollbar(hosts_wrap, hosts_canvas.yview)
-        hosts_frame = tk.Frame(hosts_canvas, bg=UI_COLORS["panel_soft"])
+        # Divider
+        tk.Frame(panel_content, bg=UI_COLORS["line"], height=1).pack(fill="x", padx=0)
+
+        # Hosts list (flat, no rounded container)
+        hosts_section = tk.Frame(panel_content, bg=P)
+        hosts_section.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(
+            hosts_section,
+            text="УСТРОЙСТВА",
+            bg=P,
+            fg=UI_COLORS["muted"],
+            font=UI_FONTS["label_xs"],
+        ).pack(anchor="w", pady=(0, 6))
+
+        hosts_canvas = tk.Canvas(hosts_section, height=160, bg=P, highlightthickness=0)
+        hosts_scroll = self._create_scrollbar(hosts_section, hosts_canvas.yview)
+        hosts_frame = tk.Frame(hosts_canvas, bg=P)
         hosts_frame.bind("<Configure>", lambda event: hosts_canvas.configure(scrollregion=hosts_canvas.bbox("all")))
         hosts_canvas.create_window((0, 0), window=hosts_frame, anchor="nw")
         hosts_canvas.configure(yscrollcommand=hosts_scroll.set)
@@ -1996,8 +1984,20 @@ class App:
         self.hosts_canvas = hosts_canvas
         self.hosts_frame = hosts_frame
 
-        details = tk.Frame(panel_content, bg=UI_COLORS["panel"])
-        details.pack(fill="both", expand=True, padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["tight"]))
+        # Divider
+        tk.Frame(panel_content, bg=UI_COLORS["line"], height=1).pack(fill="x", padx=0, pady=(10, 0))
+
+        # Details section (flat rows)
+        details_section = tk.Frame(panel_content, bg=P)
+        details_section.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(
+            details_section,
+            text="ИНФОРМАЦИЯ",
+            bg=P,
+            fg=UI_COLORS["muted"],
+            font=UI_FONTS["label_xs"],
+        ).pack(anchor="w", pady=(0, 8))
+
         self.details_vars = {
             "name": tk.StringVar(value="-"),
             "folder": tk.StringVar(value="-"),
@@ -2006,35 +2006,48 @@ class App:
             "csv": tk.StringVar(value="-"),
             "updated": tk.StringVar(value="-"),
         }
-        self._build_detail_row(details, "Имя", self.details_vars["name"])
-        self._build_detail_row(details, "Папка", self.details_vars["folder"])
-        self._build_detail_row(details, "Конфиг", self.details_vars["config"])
-        self._build_detail_row(details, "Excel", self.details_vars["excel"])
-        self._build_detail_row(details, "CSV", self.details_vars["csv"])
-        self._build_detail_row(details, "Обновлено", self.details_vars["updated"])
+        self._build_detail_row(details_section, "Имя", self.details_vars["name"])
+        self._build_detail_row(details_section, "Папка", self.details_vars["folder"])
+        self._build_detail_row(details_section, "Конфиг", self.details_vars["config"])
+        self._build_detail_row(details_section, "Excel", self.details_vars["excel"])
+        self._build_detail_row(details_section, "CSV", self.details_vars["csv"])
+        self._build_detail_row(details_section, "Обновлено", self.details_vars["updated"])
 
-        actions = tk.Frame(panel_content, bg=UI_COLORS["panel"])
-        actions.pack(fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["section"]))
+        # Divider
+        tk.Frame(panel_content, bg=UI_COLORS["line"], height=1).pack(fill="x", padx=0, pady=(4, 0))
+
+        # Actions
+        actions = tk.Frame(panel_content, bg=P)
+        actions.pack(fill="x", padx=14, pady=(10, 14))
         self._create_round_button(actions, "Добавить/заменить конфиг", self.attach_config_to_selected_device).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Открыть CSV конфиг", self.open_selected_config).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Открыть Excel", self.open_selected_excel).pack(fill="x", pady=(0, 6))
         self._create_round_button(actions, "Удалить устройство", self.delete_selected_device, style_kind="danger").pack(fill="x")
 
     def _build_detail_row(self, parent: tk.Frame, label: str, value_var: tk.StringVar) -> None:
-        row = tk.Frame(parent, bg=UI_COLORS["panel"])
-        row.pack(fill="x", pady=(0, UI_SPACING["gap"]))
-        tk.Label(row, text=label, width=11, anchor="w", bg=UI_COLORS["panel"], fg=UI_COLORS["muted"]).pack(side="left", padx=(0, 6))
+        P = UI_COLORS["panel"]
+        row = tk.Frame(parent, bg=P)
+        row.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            row,
+            text=label,
+            width=9,
+            anchor="w",
+            bg=P,
+            fg=UI_COLORS["muted"],
+            font=UI_FONTS["label_sm"],
+        ).pack(side="left", padx=(0, 8))
         tk.Label(
             row,
             textvariable=value_var,
             anchor="w",
             justify="left",
-            bg=UI_COLORS["panel_soft"],
+            bg=P,
             fg=UI_COLORS["text"],
-            padx=10,
-            pady=7,
-            wraplength=195,
+            font=UI_FONTS["label_sm"],
+            wraplength=200,
         ).pack(side="left", fill="x", expand=True)
+        tk.Frame(parent, bg=UI_COLORS["line"], height=1).pack(fill="x")
 
     def _draw_rounded_rect(
         self,
@@ -2141,6 +2154,80 @@ class App:
         canvas._rounded_border_width = border_width  # type: ignore[attr-defined]
         self._redraw_rounded_canvas(canvas)
 
+    @staticmethod
+    def _hex_lerp(color_a: str, color_b: str, t: float) -> str:
+        """Interpolate between two hex colors (#RRGGBB). t=0 → a, t=1 → b."""
+        def _parse(c: str) -> tuple:
+            c = c.lstrip("#")
+            return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        ra, ga, ba = _parse(color_a)
+        rb, gb, bb = _parse(color_b)
+        r = int(ra + (rb - ra) * t)
+        g = int(ga + (gb - ga) * t)
+        b = int(ba + (bb - ba) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _animate_hover(
+        self,
+        canvas: tk.Canvas,
+        widgets: list,
+        color_from: str,
+        color_to: str,
+        border_color: str,
+        border_width: int,
+        steps: int = 6,
+        delay: int = 16,
+        _step: int = 0,
+    ) -> None:
+        """Smooth color transition for hover effects (runs via after())."""
+        if _step > steps:
+            return
+        t = _step / steps
+        mid = self._hex_lerp(color_from, color_to, t)
+        try:
+            canvas._rounded_fill = mid  # type: ignore[attr-defined]
+            self._set_rounded_style(canvas, border_color, border_width)
+            for w in widgets:
+                w.configure(bg=mid)
+        except tk.TclError:
+            return
+        self.root.after(
+            delay,
+            lambda: self._animate_hover(canvas, widgets, color_from, color_to, border_color, border_width, steps, delay, _step + 1),
+        )
+
+    def _create_icon_badge(
+        self,
+        parent: tk.Widget,
+        text: str,
+        bg_color: str,
+        *,
+        fg: str = "#FFFFFF",
+        size: int = 32,
+        radius: int = 10,
+    ) -> tk.Canvas:
+        """Rounded square icon badge drawn on Canvas."""
+        outer_bg = parent.cget("bg") if hasattr(parent, "cget") else UI_COLORS["panel"]
+        canvas = tk.Canvas(parent, width=size, height=size, bg=outer_bg, highlightthickness=0, bd=0)
+        canvas.create_polygon(
+            radius, 0,
+            size - radius, 0,
+            size, 0,
+            size, radius,
+            size, size - radius,
+            size, size,
+            size - radius, size,
+            radius, size,
+            0, size,
+            0, size - radius,
+            0, radius,
+            0, 0,
+            smooth=True, splinesteps=12,
+            fill=bg_color, outline=bg_color,
+        )
+        canvas.create_text(size // 2, size // 2, text=text, fill=fg, font=UI_FONTS["label_sm_bold"])
+        return canvas
+
     def _create_round_button(
         self,
         parent: tk.Widget,
@@ -2222,14 +2309,9 @@ class App:
         entry.pack(fill="both", expand=True, padx=10, pady=3)
         return shell, entry
 
-    def _create_scrollbar(self, parent: tk.Widget, command) -> RoundedScrollbar:
-        return RoundedScrollbar(
-            parent,
-            command,
-            track_color=UI_COLORS["scrollbar_track"],
-            thumb_color=UI_COLORS["scrollbar_thumb"],
-            thumb_hover_color=UI_COLORS["scrollbar_thumb_active"],
-        )
+    def _create_scrollbar(self, parent: tk.Widget, command) -> tk.Scrollbar:
+        # Keep scrollbar native so macOS renders system style.
+        return tk.Scrollbar(parent, orient="vertical", command=command, relief="flat", bd=0, highlightthickness=0)
 
     @staticmethod
     def _scroll_units_from_event(event: tk.Event) -> int:
@@ -2398,6 +2480,239 @@ class App:
         menu.bind("<FocusOut>", lambda _e: menu.destroy())
         menu.focus_force()
 
+    def _choose_device_dialog(self, title: str, prompt: str, *, exclude_name: Optional[str] = None) -> Optional[str]:
+        options = sorted([name for name in self.devices.keys() if name != exclude_name], key=str.lower)
+        if not options:
+            messagebox.showwarning("Нет устройств", "Нет доступных устройств для выбора.")
+            return None
+        decision = {"value": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("520x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=UI_COLORS["bg"])
+        body_canvas, body = self._create_rounded_container(
+            dialog,
+            outer_bg=UI_COLORS["bg"],
+            fill_color=UI_COLORS["panel_soft"],
+            border_color=UI_COLORS["line"],
+            radius=UI_STYLE_KIT["radius_card"],
+            border_width=1,
+            min_height=UI_STYLE_KIT["height_color_picker"],
+        )
+        body_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(body, text=prompt, bg=UI_COLORS["panel_soft"], fg=UI_COLORS["text"], anchor="w", justify="left").pack(fill="x", pady=(8, 8))
+        selected_var = tk.StringVar(value=options[0])
+        ttk.Combobox(body, values=options, textvariable=selected_var, state="readonly", width=32, style="Vault.TCombobox").pack(anchor="w")
+
+        actions = tk.Frame(body, bg=UI_COLORS["panel_soft"])
+        actions.pack(fill="x", pady=(10, 0))
+
+        def on_ok() -> None:
+            decision["value"] = selected_var.get().strip()
+            dialog.destroy()
+
+        self._create_round_button(actions, "Выбрать", on_ok).pack(side="right")
+        self._create_round_button(actions, "Отмена", dialog.destroy, style_kind="ghost").pack(side="right", padx=(0, 8))
+        self.root.wait_window(dialog)
+        return decision["value"]
+
+    def _choose_devices_dialog(self, title: str, prompt: str, *, exclude_name: Optional[str] = None) -> List[str]:
+        options = sorted([name for name in self.devices.keys() if name != exclude_name], key=str.lower)
+        if not options:
+            messagebox.showwarning("Нет устройств", "Нет доступных устройств для выбора.")
+            return []
+
+        selection: Dict[str, List[str]] = {"values": []}
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("560x420")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=UI_COLORS["bg"])
+
+        body_canvas, body = self._create_rounded_container(
+            dialog,
+            outer_bg=UI_COLORS["bg"],
+            fill_color=UI_COLORS["panel_soft"],
+            border_color=UI_COLORS["line"],
+            radius=UI_STYLE_KIT["radius_card"],
+            border_width=1,
+            min_height=UI_STYLE_KIT["height_transfer_editor"],
+        )
+        body_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(body, text=prompt, bg=UI_COLORS["panel_soft"], fg=UI_COLORS["text"], anchor="w", justify="left").pack(fill="x", pady=(8, 8))
+
+        list_wrap = tk.Frame(body, bg=UI_COLORS["panel_soft"])
+        list_wrap.pack(fill="both", expand=True)
+        listbox = tk.Listbox(
+            list_wrap,
+            selectmode="multiple",
+            bg=UI_COLORS["panel"],
+            fg=UI_COLORS["text"],
+            relief="flat",
+            highlightthickness=0,
+            activestyle="none",
+        )
+        list_scroll = self._create_scrollbar(list_wrap, listbox.yview)
+        listbox.configure(yscrollcommand=list_scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="right", fill="y")
+        for name in options:
+            listbox.insert("end", name)
+        self._bind_vertical_mousewheel(listbox, listbox, list_wrap, body)
+
+        actions = tk.Frame(body, bg=UI_COLORS["panel_soft"])
+        actions.pack(fill="x", pady=(10, 0))
+
+        def _select_all() -> None:
+            listbox.selection_set(0, "end")
+
+        def _clear_all() -> None:
+            listbox.selection_clear(0, "end")
+
+        def _confirm() -> None:
+            indices = listbox.curselection()
+            selection["values"] = [options[i] for i in indices]
+            dialog.destroy()
+
+        self._create_round_button(actions, "Выбрать все", _select_all, style_kind="ghost").pack(side="left")
+        self._create_round_button(actions, "Снять выбор", _clear_all, style_kind="ghost").pack(side="left", padx=(8, 0))
+        self._create_round_button(actions, "Выбрать", _confirm).pack(side="right")
+        self._create_round_button(actions, "Отмена", dialog.destroy, style_kind="ghost").pack(side="right", padx=(0, 8))
+
+        self.root.wait_window(dialog)
+        return selection["values"]
+
+    def _build_merged_source_parser(self, source_names: List[str]) -> Optional[FortigateConfigParser]:
+        if not source_names:
+            return None
+        loaded_parsers: List[FortigateConfigParser] = []
+        current_selected = self.selected_device_name
+        try:
+            for source_name in source_names:
+                if source_name not in self.devices:
+                    continue
+                self.select_device(source_name)
+                parser = self._load_parser_for_selected_device(profile="addresses")
+                if parser is not None:
+                    loaded_parsers.append(parser)
+        finally:
+            if current_selected and current_selected in self.devices:
+                self.select_device(current_selected)
+
+        if not loaded_parsers:
+            return None
+
+        first = loaded_parsers[0]
+        merged = FortigateConfigParser(first.config_path)
+        merged.address_objects = {name: dict(obj) for name, obj in first.address_objects.items()}
+        merged.address_group_objects = {name: dict(obj) for name, obj in first.address_group_objects.items()}
+        merged.address_group_members = {name: list(members) for name, members in first.address_group_members.items()}
+        merged.address_entries = [dict(obj) for obj in first.address_entries]
+        merged.address_group_entries = [dict(obj) for obj in first.address_group_entries]
+
+        conflicts: List[str] = []
+
+        def _obj_signature(obj: Dict[str, str]) -> str:
+            return json.dumps({k: str(v) for k, v in sorted(obj.items())}, ensure_ascii=False, sort_keys=True)
+
+        for parser in loaded_parsers[1:]:
+            for name, obj in parser.address_objects.items():
+                if name in merged.address_objects:
+                    if _obj_signature(merged.address_objects[name]) != _obj_signature(obj):
+                        conflicts.append(f"address:{name}")
+                    continue
+                merged.address_objects[name] = dict(obj)
+            for name, obj in parser.address_group_objects.items():
+                if name in merged.address_group_objects:
+                    if _obj_signature(merged.address_group_objects[name]) != _obj_signature(obj):
+                        conflicts.append(f"group:{name}")
+                else:
+                    merged.address_group_objects[name] = dict(obj)
+                existing_members = merged.address_group_members.get(name, [])
+                for member in parser.address_group_members.get(name, []):
+                    if member not in existing_members:
+                        existing_members.append(member)
+                merged.address_group_members[name] = existing_members
+            merged.address_entries.extend(dict(obj) for obj in parser.address_entries if obj.get("_name", ""))
+            merged.address_group_entries.extend(dict(obj) for obj in parser.address_group_entries if obj.get("_name", ""))
+
+        if conflicts:
+            preview = ", ".join(sorted(set(conflicts))[:10])
+            suffix = " ..." if len(set(conflicts)) > 10 else ""
+            messagebox.showwarning(
+                "Конфликт имен в источниках",
+                "Часть объектов с одинаковыми именами имеет разные значения между источниками.\n"
+                f"Оставлены объекты из первого выбранного устройства.\nПримеры: {preview}{suffix}",
+            )
+        return merged
+
+    def _open_transfer_direction_dialog(self, device_name: str) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Добавить адреса")
+        dialog.geometry("560x210")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=UI_COLORS["bg"])
+
+        body_canvas, body = self._create_rounded_container(
+            dialog,
+            outer_bg=UI_COLORS["bg"],
+            fill_color=UI_COLORS["panel_soft"],
+            border_color=UI_COLORS["line"],
+            radius=UI_STYLE_KIT["radius_card"],
+            border_width=1,
+            min_height=UI_STYLE_KIT["height_add_device_dialog"],
+        )
+        body_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(
+            body,
+            text=f"Устройство: {device_name}\nВыберите направление переноса адресов.",
+            bg=UI_COLORS["panel_soft"],
+            fg=UI_COLORS["text"],
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(8, 10))
+
+        actions = tk.Frame(body, bg=UI_COLORS["panel_soft"])
+        actions.pack(fill="x")
+
+        def on_to_this() -> None:
+            source_names = self._choose_devices_dialog(
+                "Источники адресов",
+                f"Выберите одно или несколько устройств-источников для переноса на '{device_name}'.",
+                exclude_name=device_name,
+            )
+            if not source_names:
+                return
+            merged_source_parser = self._build_merged_source_parser(source_names)
+            if merged_source_parser is None:
+                messagebox.showwarning("Нет данных", "Не удалось загрузить адреса из выбранных устройств.")
+                return
+            dialog.destroy()
+            self.open_address_transfer_dialog(
+                source_device_name=", ".join(source_names),
+                source_device_names=source_names,
+                target_device_name=device_name,
+                parser_override=merged_source_parser,
+            )
+
+        def on_from_this() -> None:
+            dialog.destroy()
+            self.open_address_transfer_dialog(source_device_name=device_name)
+
+        self._create_round_button(actions, "Добавить на это устройство", on_to_this).pack(fill="x", pady=(0, 6))
+        self._create_round_button(actions, "Добавить с этого устройства", on_from_this, style_kind="ghost").pack(fill="x")
+
+    def _open_transfer_direction_for_selected_device(self) -> None:
+        record = self._get_selected_device()
+        if not record:
+            return
+        self._open_transfer_direction_dialog(record.name)
+
     def _show_right_panel(self) -> None:
         if self.right_panel_canvas is None or self.right_panel_visible:
             return
@@ -2414,33 +2729,7 @@ class App:
         self._open_device_page(device_name)
 
     def _load_devices(self) -> None:
-        records: Dict[str, DeviceRecord] = {}
-        vault_root = DEVICES_DIR.resolve()
-        for folder in sorted(DEVICES_DIR.iterdir()):
-            if not folder.is_dir():
-                continue
-            if folder.is_symlink():
-                continue
-            try:
-                resolved_folder = ensure_under_root(folder, vault_root, must_exist=True)
-            except ValueError:
-                continue
-            config_files = sorted(folder.glob("*.conf")) + sorted(folder.glob("*.txt"))
-            excel_files = sorted(folder.glob("*.xlsx"))
-            csv_files = sorted(folder.glob("*.csv"))
-            config_files = [path for path in config_files if self._is_device_vault_path(path)]
-            excel_files = [path for path in excel_files if self._is_device_vault_path(path)]
-            csv_files = [path for path in csv_files if self._is_device_vault_path(path)]
-            mtime = datetime.fromtimestamp(folder.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            records[folder.name] = DeviceRecord(
-                name=folder.name,
-                folder=resolved_folder,
-                config_path=config_files[0] if config_files else None,
-                excel_path=excel_files[0] if excel_files else None,
-                csv_path=csv_files[0] if csv_files else None,
-                updated_at=mtime,
-            )
-        self.devices = records
+        self.devices = load_devices_from_disk(DEVICES_DIR)
         self.opened_devices = [name for name in self.opened_devices if name in self.devices]
         if self.active_device_tab not in self.devices:
             self.active_device_tab = self.opened_devices[-1] if self.opened_devices else None
@@ -2451,6 +2740,31 @@ class App:
         self._refresh_open_tabs()
         self._refresh_devices_view()
 
+    def _build_empty_state(self, parent: tk.Frame) -> None:
+        """Termius-style centered empty state."""
+        PS = UI_COLORS["panel_soft"]
+        wrap = tk.Frame(parent, bg=PS)
+        wrap.place(relx=0.5, rely=0.45, anchor="center")
+
+        badge = self._create_icon_badge(wrap, "FW", UI_COLORS["panel"], fg=UI_COLORS["muted"], size=60, radius=22)
+        badge.pack(pady=(0, 20))
+
+        tk.Label(
+            wrap,
+            text="Нет устройств",
+            bg=PS,
+            fg=UI_COLORS["text"],
+            font=UI_FONTS["title_md_bold"],
+        ).pack()
+        tk.Label(
+            wrap,
+            text="Добавьте FortiGate конфигурацию чтобы начать анализ",
+            bg=PS,
+            fg=UI_COLORS["muted"],
+            font=UI_FONTS["label_md"],
+        ).pack(pady=(6, 20))
+        self._create_round_button(wrap, "+ Добавить устройство", self.open_add_device_dialog).pack()
+
     def _refresh_devices_view(self) -> None:
         self._refresh_right_hosts()
         self.card_canvases = {}
@@ -2459,105 +2773,105 @@ class App:
             for child in self.cards_frame.winfo_children():
                 child.destroy()
             if not self.devices:
-                tk.Label(
-                    self.cards_frame,
-                    text="Пока нет устройств.\nНажмите «Добавить устройство» слева.",
-                    bg=UI_COLORS["panel_soft"],
-                    fg=UI_COLORS["muted"],
-                    justify="left",
-                    font=UI_FONTS["label_lg"],
-                ).pack(anchor="w", padx=UI_SPACING["section"], pady=UI_SPACING["section"])
+                self._build_empty_state(self.cards_frame)
             else:
+                PS = UI_COLORS["panel_soft"]
+                P = UI_COLORS["panel"]
+
+                # Badge accent colours — rotate for visual variety
+                BADGE_COLORS = ["#5B6BDF", "#E07B54", "#54A0D0", "#7B54D0", "#54C08A", "#D05470"]
+
+                # 2-column grid like Termius
                 self.cards_frame.grid_columnconfigure(0, weight=1)
                 self.cards_frame.grid_columnconfigure(1, weight=1)
+
                 for index, record in enumerate(self.devices.values()):
                     is_selected = record.name == self.selected_device_name
-                    card_canvas, card = self._create_rounded_container(
+                    badge_color = BADGE_COLORS[index % len(BADGE_COLORS)]
+                    border_col = UI_COLORS["accent"] if is_selected else "transparent"
+                    card_bg = UI_COLORS["sidebar_item_active"] if is_selected else P
+
+                    # Termius-style tile: rounded container, no border by default
+                    card_canvas, card_inner = self._create_rounded_container(
                         self.cards_frame,
-                        outer_bg=UI_COLORS["panel_soft"],
-                        fill_color=UI_COLORS["panel"],
-                        border_color=UI_COLORS["accent"] if is_selected else UI_COLORS["line"],
+                        outer_bg=PS,
+                        fill_color=card_bg,
+                        border_color=UI_COLORS["accent"] if is_selected else card_bg,
                         radius=UI_STYLE_KIT["radius_device_card"],
                         border_width=2 if is_selected else 1,
-                        min_height=UI_STYLE_KIT["height_device_card"] + UI_STYLE_KIT["height_button_md"] + 28,
+                        min_height=UI_STYLE_KIT["height_device_card"] + 20,
                     )
                     card_canvas.grid(
                         row=index // 2,
                         column=index % 2,
                         sticky="nsew",
-                        padx=UI_SPACING["gap"],
-                        pady=UI_SPACING["gap"],
+                        padx=6,
+                        pady=6,
                     )
                     self.card_canvases[record.name] = card_canvas
 
-                    top = tk.Frame(card, bg=UI_COLORS["panel"])
-                    top.pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["section"], UI_SPACING["tight"]))
-                    if hasattr(self, "_small_icon_ref"):
-                        tk.Label(top, image=self._small_icon_ref, bg=UI_COLORS["panel"]).pack(side="left")
-                    else:
-                        tk.Label(top, text="[]", bg=UI_COLORS["panel"], fg=UI_COLORS["muted"]).pack(side="left")
-                    tk.Label(
-                        top,
+                    body = tk.Frame(card_inner, bg=card_bg)
+                    body.pack(fill="both", expand=True, padx=10, pady=10)
+
+                    # Top row: icon + name
+                    top_row = tk.Frame(body, bg=card_bg)
+                    top_row.pack(fill="x")
+
+                    icon_badge = self._create_icon_badge(top_row, "FW", badge_color, size=36, radius=12)
+                    icon_badge.configure(bg=card_bg)
+                    icon_badge.pack(side="left")
+
+                    name_lbl = tk.Label(
+                        top_row,
                         text=record.name,
-                        bg=UI_COLORS["panel"],
+                        bg=card_bg,
                         fg=UI_COLORS["text"],
                         font=UI_FONTS["label_lg_bold"],
-                    ).pack(side="left", padx=(8, 0))
-                    edit_btn = tk.Label(
-                        top,
-                        text="✎",
-                        bg=UI_COLORS["panel_soft"],
-                        fg=UI_COLORS["muted"],
-                        font=UI_FONTS["action_bold"],
-                        padx=8,
-                        pady=2,
+                        anchor="w",
                     )
-                    edit_btn.pack(side="right")
-                    edit_btn.bind("<Button-1>", lambda _event, n=record.name: self._open_device_page(n))
+                    name_lbl.pack(side="left", padx=(10, 0))
 
-                    tk.Label(
-                        card,
-                        text=(
-                            f"config: {record.config_path.name if record.config_path else '-'}\n"
-                            f"excel: {record.excel_path.name if record.excel_path else '-'}\n"
-                            f"csv: {record.csv_path.name if record.csv_path else '-'}"
-                        ),
-                        bg=UI_COLORS["panel"],
+                    # Detail row
+                    config_text = record.config_path.name if record.config_path else "нет конфига"
+                    detail_lbl = tk.Label(
+                        body,
+                        text=f"{config_text}  ·  {record.updated_at}",
+                        bg=card_bg,
                         fg=UI_COLORS["muted"],
-                        justify="left",
+                        font=UI_FONTS["label_sm"],
                         anchor="w",
-                    ).pack(fill="x", padx=UI_SPACING["section"])
-                    tk.Label(
-                        card,
-                        text=f"updated: {record.updated_at}",
-                        bg=UI_COLORS["panel"],
-                        fg=UI_COLORS["muted"],
-                        justify="left",
-                        anchor="w",
-                    ).pack(fill="x", padx=UI_SPACING["section"], pady=(UI_SPACING["tight"], UI_SPACING["gap"]))
+                    )
+                    detail_lbl.pack(anchor="w", pady=(6, 0))
 
-                    action_row = tk.Frame(card, bg=UI_COLORS["panel"])
-                    action_row.pack(fill="x", padx=UI_SPACING["section"], pady=(0, UI_SPACING["section"]))
-                    self._create_round_button(
-                        action_row,
-                        "Открыть страницу устройства",
-                        lambda device_name=record.name: self._open_device_page(device_name),
-                        min_height=UI_STYLE_KIT["height_button_md"],
-                    ).pack(fill="x", pady=(0, 6))
-                    self._create_round_button(
-                        action_row,
-                        "Открыть в редакторе",
-                        lambda device_name=record.name: self._open_device_editor(device_name),
-                        style_kind="ghost",
-                        min_height=UI_STYLE_KIT["height_button_md"],
-                    ).pack(fill="x")
-                    click_widgets = (card_canvas, card, top)
-                    for widget in click_widgets:
-                        widget.bind("<Button-1>", lambda _event, n=record.name: self._open_device_page(n))
-                    hover_widgets = (card_canvas, card, top, action_row)
-                    for widget in hover_widgets:
-                        widget.bind("<Enter>", lambda _event, n=record.name, s=is_selected: self._set_card_hover(n, s, True))
-                        widget.bind("<Leave>", lambda _event, n=record.name, s=is_selected: self._set_card_hover(n, s, False))
+                    # Click on whole card = open device page
+                    click_targets = (card_canvas, card_inner, body, top_row, name_lbl, detail_lbl)
+                    for w in click_targets:
+                        w.bind("<Button-1>", lambda _e, n=record.name: self._open_device_page(n))
+
+                    hover_bg = UI_COLORS["sidebar_item_hover"] if not is_selected else UI_COLORS["sidebar_item_active"]
+                    anim_widgets = [card_inner, body, top_row]
+
+                    def _on_enter(
+                        _e, cv=card_canvas, ws=anim_widgets, from_c=card_bg, to_c=hover_bg, sel=is_selected,
+                    ) -> None:
+                        self._animate_hover(
+                            cv, ws, from_c, to_c,
+                            border_color=UI_COLORS["line_soft"] if sel else UI_COLORS["line"],
+                            border_width=1,
+                        )
+
+                    def _on_leave(
+                        _e, cv=card_canvas, ws=anim_widgets, from_c=hover_bg, to_c=card_bg, sel=is_selected,
+                    ) -> None:
+                        self._animate_hover(
+                            cv, ws, from_c, to_c,
+                            border_color=UI_COLORS["line_soft"] if sel else card_bg,
+                            border_width=1,
+                        )
+
+                    for w in (card_canvas, card_inner, body, top_row, name_lbl, detail_lbl):
+                        w.bind("<Enter>", _on_enter)
+                        w.bind("<Leave>", _on_leave)
 
         if self.selected_device_name:
             self.select_device(self.selected_device_name, refresh_hosts=False)
@@ -2577,10 +2891,8 @@ class App:
         if refresh_hosts:
             self._refresh_right_hosts()
         for device_name, canvas in self.card_canvases.items():
-            if device_name == self.selected_device_name:
-                self._set_rounded_style(canvas, UI_COLORS["accent"], 2)
-            else:
-                self._set_rounded_style(canvas, UI_COLORS["line"], 1)
+            is_sel = device_name == self.selected_device_name
+            self._set_rounded_style(canvas, UI_COLORS["line_soft"] if is_sel else UI_COLORS["line"], 1)
         self._fill_details(self.devices[name])
 
     def _refresh_right_hosts(self) -> None:
@@ -2604,9 +2916,9 @@ class App:
                 self.hosts_frame,
                 outer_bg=UI_COLORS["panel_soft"],
                 fill_color=UI_COLORS["panel"],
-                border_color=UI_COLORS["accent"] if is_selected else UI_COLORS["line"],
+                border_color=UI_COLORS["line_soft"] if is_selected else UI_COLORS["line"],
                 radius=UI_STYLE_KIT["radius_card"],
-                border_width=2 if is_selected else 1,
+                border_width=1,
                 min_height=UI_STYLE_KIT["height_tile"],
             )
             tile_canvas.pack(fill="x", padx=4, pady=4)
@@ -2652,18 +2964,18 @@ class App:
         if canvas is None:
             return
         if is_selected:
-            self._set_rounded_style(canvas, UI_COLORS["accent"], 2)
+            self._set_rounded_style(canvas, UI_COLORS["line_soft"], 1)
             return
-        self._set_rounded_style(canvas, UI_COLORS["accent_soft"] if hover else UI_COLORS["line"], 2 if hover else 1)
+        self._set_rounded_style(canvas, UI_COLORS["line_soft"] if hover else UI_COLORS["line"], 1)
 
     def _set_host_hover(self, device_name: str, is_selected: bool, hover: bool) -> None:
         canvas = self.host_tile_canvases.get(device_name)
         if canvas is None:
             return
         if is_selected:
-            self._set_rounded_style(canvas, UI_COLORS["accent"], 2)
+            self._set_rounded_style(canvas, UI_COLORS["line_soft"], 1)
             return
-        self._set_rounded_style(canvas, UI_COLORS["accent_soft"] if hover else UI_COLORS["line"], 2 if hover else 1)
+        self._set_rounded_style(canvas, UI_COLORS["line_soft"] if hover else UI_COLORS["line"], 1)
 
     def _fill_details(self, record: Optional[DeviceRecord]) -> None:
         if record is None:
@@ -2725,9 +3037,6 @@ class App:
     def _replace_name_in_members(members: List[str], old_name: str, new_name: str) -> List[str]:
         return [new_name if item == old_name else item for item in members]
 
-    def _replace_or_append_config_section(self, config_text: str, section_name: str, section_body: str) -> str:
-        return replace_or_append_config_section(config_text, section_name, section_body)
-
     def _persist_current_address_data_to_selected_config(self) -> bool:
         if self.last_parser is None:
             return False
@@ -2746,8 +3055,8 @@ class App:
         group_lines = parser.render_addrgrp_config_lines()
 
         text = safe_config.read_text(encoding="utf-8", errors="ignore")
-        text = self._replace_or_append_config_section(text, "firewall address", "\n".join(address_lines))
-        text = self._replace_or_append_config_section(text, "firewall addrgrp", "\n".join(group_lines))
+        text = replace_or_append_config_section(text, "firewall address", "\n".join(address_lines))
+        text = replace_or_append_config_section(text, "firewall addrgrp", "\n".join(group_lines))
         safe_config.write_text(text, encoding="utf-8")
         self.status_var.set(f"Конфиг устройства '{record.name}' обновлен по примененным командам.")
         self._load_devices()
@@ -3059,22 +3368,6 @@ class App:
         )
         return parser
 
-    @staticmethod
-    def _extract_first_ipv4(value: str) -> Optional[int]:
-        return extract_first_ipv4(value)
-
-    @staticmethod
-    def _subnet_to_display(subnet: str) -> str:
-        return subnet_to_display(subnet)
-
-    @staticmethod
-    def _normalize_subnet_value(raw_value: str) -> str:
-        return normalize_subnet_value(raw_value)
-
-    @staticmethod
-    def _normalize_iprange_value(raw_value: str) -> str:
-        return normalize_iprange_value(raw_value)
-
     def _get_address_display_value(self, address_name: str) -> str:
         if self.last_parser is None:
             return ""
@@ -3100,7 +3393,7 @@ class App:
         if iprange_value:
             return "iprange", iprange_value
         subnet_value = obj.get("subnet", "").strip()
-        return "subnet", self._subnet_to_display(subnet_value) if subnet_value else ""
+        return "subnet", subnet_to_display(subnet_value) if subnet_value else ""
 
     def _open_address_editor_dialog(self, selected_addresses: Set[str]) -> bool:
         if self.last_parser is None:
@@ -3185,9 +3478,9 @@ class App:
                     edit_type = type_var.get().strip()
                     raw_value = value_var.get().strip()
                     if edit_type == "subnet":
-                        normalized = self._normalize_subnet_value(raw_value)
+                        normalized = normalize_subnet_value(raw_value)
                     elif edit_type == "iprange":
-                        normalized = self._normalize_iprange_value(raw_value)
+                        normalized = normalize_iprange_value(raw_value)
                     elif edit_type == "fqdn":
                         if not raw_value:
                             raise ValueError(f"FQDN для '{name}' не может быть пустым.")
@@ -3404,7 +3697,6 @@ class App:
 
         def _create_row_widget(name: str) -> tk.Frame:
             row = tk.Frame(frame, bg=UI_COLORS["panel"])
-            row.configure(cursor="hand2")
             row_var = vars_map[name]
             chk = tk.Checkbutton(
                 row,
@@ -3430,7 +3722,6 @@ class App:
                     bg=UI_COLORS["panel"],
                     fg=UI_COLORS["muted"],
                     font=UI_FONTS["label_md"],
-                    cursor="hand2",
                 )
                 right_label.pack(side="right", padx=(6, 4))
 
@@ -3579,8 +3870,17 @@ class App:
         preselected_groups: Optional[Set[str]] = None,
         preselected_address_color_overrides: Optional[Dict[str, int]] = None,
         reuse_current_parser: bool = False,
+        source_device_name: Optional[str] = None,
+        source_device_names: Optional[List[str]] = None,
+        target_device_name: Optional[str] = None,
+        parser_override: Optional[FortigateConfigParser] = None,
     ) -> None:
-        if reuse_current_parser and self.last_parser is not None:
+        if source_device_name and source_device_name in self.devices:
+            self.select_device(source_device_name)
+        if parser_override is not None:
+            parser = parser_override
+            self.last_parser = parser
+        elif reuse_current_parser and self.last_parser is not None:
             parser = self.last_parser
         else:
             parser = self._load_parser_for_selected_device(profile="addresses")
@@ -3603,7 +3903,11 @@ class App:
 
         tk.Label(
             dialog,
-            text="Выберите адреса и/или группы адресов для подготовки команд переноса.",
+            text=(
+                "Выберите адреса и/или группы адресов для подготовки команд переноса."
+                if not source_device_name or not target_device_name
+                else f"Источник: {source_device_name}  →  Цель: {target_device_name}"
+            ),
             anchor="w",
             justify="left",
         ).pack(fill="x", padx=10, pady=(10, 4))
@@ -3666,6 +3970,9 @@ class App:
                     preselected_groups=selected_groups,
                     preselected_address_color_overrides={k: v for k, v in address_color_overrides.items() if k in selected_addresses},
                     reuse_current_parser=True,
+                    source_device_name=source_device_name,
+                    source_device_names=source_device_names,
+                    target_device_name=target_device_name,
                 )
 
         def on_set_address_colors() -> None:
@@ -3686,7 +3993,13 @@ class App:
                 return
             dialog.destroy()
             filtered_color_overrides = {k: v for k, v in address_color_overrides.items() if k in selected_addresses}
-            self._show_selection_summary(selected_addresses, selected_groups, filtered_color_overrides)
+            self._show_selection_summary(
+                selected_addresses,
+                selected_groups,
+                filtered_color_overrides,
+                source_device_name=source_device_name,
+                target_device_name=target_device_name,
+            )
 
         self._create_round_button(actions, "Готово", on_done).pack(side="right")
         self._create_round_button(actions, "Редактор адресов", on_edit_addresses, style_kind="ghost").pack(side="left")
@@ -3700,6 +4013,8 @@ class App:
         selected_addresses: Set[str],
         selected_groups: Set[str],
         initial_address_color_overrides: Optional[Dict[str, int]] = None,
+        source_device_name: Optional[str] = None,
+        target_device_name: Optional[str] = None,
     ) -> None:
         assert self.last_parser is not None
 
@@ -3862,6 +4177,8 @@ class App:
                 selected_groups,
                 group_color_overrides,
                 address_color_overrides,
+                source_device_name=source_device_name,
+                target_device_name=target_device_name,
             )
 
         self._create_round_button(actions, "Далее", on_next).pack(side="right")
@@ -3873,6 +4190,8 @@ class App:
         selected_groups: Set[str],
         group_color_overrides: Dict[str, int],
         address_color_overrides: Dict[str, int],
+        source_device_name: Optional[str] = None,
+        target_device_name: Optional[str] = None,
     ) -> None:
         assert self.last_parser is not None
 
@@ -3889,6 +4208,8 @@ class App:
                 "1) Выполните на целевом FortiGate команду ниже.\n"
                 "2) Вставьте вывод в поле.\n"
                 "3) Нажмите 'Сгенерировать команды'."
+                + (f"\nИсточник: {source_device_name}" if source_device_name else "")
+                + (f"\nЦель: {target_device_name}" if target_device_name else "")
             ),
             anchor="w",
             justify="left",
@@ -3960,11 +4281,13 @@ class App:
             except ValueError as exc:
                 messagebox.showwarning("Невалидный ввод", str(exc), parent=dialog)
                 return
-            existing_names = self.last_parser.parse_existing_object_names(cli_output)
+            existing_index = self.last_parser.parse_existing_object_index(cli_output)
+            existing_names = set(existing_index["address"].keys()) | set(existing_index["addrgrp"].keys())
             plan = self.last_parser.build_transfer_plan(
                 selected_addresses,
                 selected_groups,
                 existing_names,
+                existing_index=existing_index,
                 group_color_overrides=group_color_overrides,
                 address_color_overrides=address_color_overrides,
             )
@@ -3996,6 +4319,8 @@ class App:
         duplicates.pack(fill="both", expand=True)
         duplicate_addresses = plan["duplicate_addresses"]
         duplicate_groups = plan["duplicate_groups"]
+        recolor_addresses = plan.get("existing_addresses_to_recolor", [])
+        recolor_groups = plan.get("existing_groups_to_recolor", [])
         lines: List[str] = []
         lines.append("Проверка на дубли выполнена.\n")
         if duplicate_groups or duplicate_addresses:
@@ -4006,6 +4331,12 @@ class App:
                 lines.append(f"- Адреса: {', '.join(duplicate_addresses)}")
         else:
             lines.append("Дубли не найдены. Все выбранные объекты включены в команды.")
+        if recolor_addresses or recolor_groups:
+            lines.append("\nБудет выполнено обновление цвета существующих объектов:")
+            if recolor_addresses:
+                lines.append(f"- Адреса: {', '.join(recolor_addresses)}")
+            if recolor_groups:
+                lines.append(f"- Группы: {', '.join(recolor_groups)}")
         duplicates.insert("1.0", "\n".join(lines))
         duplicates.configure(state="disabled")
 
@@ -4089,92 +4420,13 @@ class App:
         self.root.wait_window(dialog)
         return decision["update"]
 
-    def _fetch_remote_version(self) -> str:
-        url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/VERSION"
-        with urlopen(url, timeout=15) as resp:
-            return resp.read().decode("utf-8").strip()
-
-    def _get_platform_asset_name(self) -> str:
-        system = platform.system().lower()
-        if system == "windows":
-            return "FortiGateAnalyzer-Setup.exe"
-        if system == "darwin":
-            return "FortiGateAnalyzer-macOS.pkg"
-        raise RuntimeError(f"Платформа не поддерживается автообновлением: {platform.system()}")
-
-    def _fetch_latest_asset_urls(self, asset_name: str) -> Tuple[str, str]:
-        api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-        with urlopen(api_url, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        asset_url = ""
-        checksum_url = ""
-        for asset in payload.get("assets", []):
-            name = asset.get("name")
-            if name == asset_name:
-                asset_url = asset.get("browser_download_url", "")
-            elif name == f"{asset_name}.sha256":
-                checksum_url = asset.get("browser_download_url", "")
-        if not asset_url:
-            raise RuntimeError(f"В релизе не найден файл: {asset_name}")
-        if not checksum_url:
-            raise RuntimeError(f"В релизе не найден checksum файл: {asset_name}.sha256")
-        return asset_url, checksum_url
-
-    def _download_binary(self, url: str, target: Path) -> None:
-        with urlopen(url, timeout=60) as resp:
-            with target.open("wb") as handle:
-                shutil.copyfileobj(resp, handle)
-
-    def _fetch_asset_checksum(self, checksum_url: str, expected_filename: str) -> str:
-        with urlopen(checksum_url, timeout=30) as resp:
-            payload = resp.read().decode("utf-8", errors="ignore")
-        return parse_sha256_file(payload, expected_filename=expected_filename)
-
-    def _download_update_asset(self, url: str, filename: str, expected_sha256: str) -> Path:
-        temp_dir = Path(tempfile.mkdtemp(prefix="forti-update-"))
-        target = temp_dir / filename
-        self._download_binary(url, target)
-        actual_sha = sha256_file(target)
-        if actual_sha.lower() != expected_sha256.lower():
-            raise RuntimeError("Скачанный установщик не прошел проверку SHA256.")
-        return target
-
-    def _run_installer_and_restart(self, installer_path: Path) -> None:
-        system = platform.system().lower()
-        if system == "windows":
-            subprocess.Popen(
-                [
-                    str(installer_path),
-                    "/CLOSEAPPLICATIONS",
-                    "/RESTARTAPPLICATIONS",
-                ],
-                shell=False,
-            )
-            self.root.after(200, self.root.destroy)
-            return
-
-        if system == "darwin":
-            # For macOS installer we open .pkg and schedule app relaunch.
-            subprocess.Popen(["open", str(installer_path)])
-            subprocess.Popen(
-                [
-                    "/bin/sh",
-                    "-c",
-                    "sleep 5; open -a FortiGateAnalyzer",
-                ],
-                start_new_session=True,
-            )
-            self.root.after(200, self.root.destroy)
-            return
-
-        raise RuntimeError(f"Платформа не поддерживается автообновлением: {platform.system()}")
 
     def check_for_updates(self) -> None:
         self.status_var.set("Проверка обновлений...")
 
         def worker() -> None:
             try:
-                remote_version = self._fetch_remote_version()
+                remote_version = fetch_remote_version()
             except (URLError, TimeoutError, OSError) as exc:
                 self.root.after(0, lambda: self.status_var.set(f"Не удалось проверить обновления: {exc}"))
                 return
@@ -4193,13 +4445,13 @@ class App:
                     return
 
                 try:
-                    asset_name = self._get_platform_asset_name()
-                    asset_url, checksum_url = self._fetch_latest_asset_urls(asset_name)
-                    expected_sha = self._fetch_asset_checksum(checksum_url, asset_name)
+                    asset_name = get_platform_asset_name()
+                    asset_url, checksum_url = fetch_latest_asset_urls(asset_name)
+                    expected_sha = fetch_asset_checksum(checksum_url, asset_name)
                     self.status_var.set(f"Скачивание обновления {remote_version}...")
-                    installer = self._download_update_asset(asset_url, asset_name, expected_sha)
+                    installer = download_update_asset(asset_url, asset_name, expected_sha)
                     self.status_var.set("Запуск установщика обновления...")
-                    self._run_installer_and_restart(installer)
+                    run_installer(installer, on_quit=lambda: self.root.after(200, self.root.destroy))
                 except Exception as exc:
                     self.status_var.set(f"Не удалось установить обновление: {exc}")
                     messagebox.showerror("Обновление", str(exc))
