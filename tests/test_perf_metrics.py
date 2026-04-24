@@ -2,8 +2,6 @@ import json
 from pathlib import Path
 import sys
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from perf_metrics import PerfRecorder
@@ -35,9 +33,9 @@ def test_record_appends_multiple_entries(tmp_path: Path) -> None:
     recorder.record("step_2", 20.0)
     recorder.record("step_3", 30.0)
 
-    lines = [l for l in target.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [ln for ln in target.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 3
-    metrics = [json.loads(l)["metric"] for l in lines]
+    metrics = [json.loads(ln)["metric"] for ln in lines]
     assert metrics == ["step_1", "step_2", "step_3"]
 
 

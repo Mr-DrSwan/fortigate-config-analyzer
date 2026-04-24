@@ -951,7 +951,7 @@ class FortigateConfigParser:
                                     cell_length = len(str(cell.value))
                                     if cell_length > max_length:
                                         max_length = cell_length
-                                except:
+                                except Exception:
                                     pass
                             adjusted_width = min(max_length + 2, 50)
                             worksheet.column_dimensions[column_letter].width = adjusted_width
@@ -1041,9 +1041,8 @@ def main():
 if __name__ == "__main__":
     # Проверяем зависимости
     try:
-        import pandas as pd
-        import openpyxl
-    except ImportError as e:
+        import pandas as pd  # noqa: F401
+    except ImportError:
         print("❌ Отсутствуют необходимые библиотеки!")
         print("Установите их командой:")
         print("  pip install pandas openpyxl")

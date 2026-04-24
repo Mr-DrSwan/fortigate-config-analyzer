@@ -55,10 +55,8 @@ def install_packages():
 
     # Определяем путь к pip в зависимости от ОС
     if platform.system() == "Windows":
-        pip_path = os.path.join('.venv', 'Scripts', 'pip')
         python_path = os.path.join('.venv', 'Scripts', 'python')
     else:
-        pip_path = os.path.join('.venv', 'bin', 'pip')
         python_path = os.path.join('.venv', 'bin', 'python')
 
     # Пакеты для установки

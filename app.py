@@ -19,7 +19,6 @@ from urllib.error import URLError
 from address_utils import (
     address_sort_key,
     address_sort_mode_key,
-    extract_first_ipv4,
     get_address_display_value,
     normalize_iprange_value,
     normalize_subnet_value,
@@ -30,7 +29,6 @@ from fortigate_analyzer import FortigateConfigParser
 from perf_metrics import PerfRecorder
 from security_utils import ensure_under_root, sanitize_spreadsheet_text
 from services.device_vault import (
-    APP_NAME,
     DeviceRecord,
     get_app_data_dir,
     load_devices_from_disk,
@@ -43,7 +41,6 @@ from services.updater import (
     get_display_version,
     get_platform_asset_name,
     is_newer_version,
-    parse_version,
     run_installer,
 )
 
@@ -1539,15 +1536,15 @@ class App:
             )
             chip_lbl.pack(fill="both", expand=True)
 
-            def _enter(_e, c=chip_canvas, l=chip_lbl) -> None:
+            def _enter(_e, c=chip_canvas, lbl=chip_lbl) -> None:
                 c._rounded_fill = UI_COLORS["chip_hover"]  # type: ignore[attr-defined]
                 self._set_rounded_style(c, UI_COLORS["line_soft"], 1)
-                l.configure(bg=UI_COLORS["chip_hover"], fg=UI_COLORS["text"])
+                lbl.configure(bg=UI_COLORS["chip_hover"], fg=UI_COLORS["text"])
 
-            def _leave(_e, c=chip_canvas, l=chip_lbl) -> None:
+            def _leave(_e, c=chip_canvas, lbl=chip_lbl) -> None:
                 c._rounded_fill = UI_COLORS["panel_soft"]  # type: ignore[attr-defined]
                 self._set_rounded_style(c, UI_COLORS["line"], 1)
-                l.configure(bg=UI_COLORS["panel_soft"], fg=UI_COLORS["muted"])
+                lbl.configure(bg=UI_COLORS["panel_soft"], fg=UI_COLORS["muted"])
 
             for w in (chip_canvas, chip_inner, chip_lbl):
                 w.bind("<Enter>", _enter)
@@ -2788,7 +2785,6 @@ class App:
                 for index, record in enumerate(self.devices.values()):
                     is_selected = record.name == self.selected_device_name
                     badge_color = BADGE_COLORS[index % len(BADGE_COLORS)]
-                    border_col = UI_COLORS["accent"] if is_selected else "transparent"
                     card_bg = UI_COLORS["sidebar_item_active"] if is_selected else P
 
                     # Termius-style tile: rounded container, no border by default
@@ -3224,7 +3220,8 @@ class App:
             try:
                 self._attach_config_to_device(device_name, source_config)
             except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", str(exc)))
+                _msg = str(exc)
+                self.root.after(0, lambda m=_msg: messagebox.showerror("Ошибка", m))
                 return
 
             def on_done() -> None:
@@ -4428,10 +4425,12 @@ class App:
             try:
                 remote_version = fetch_remote_version()
             except (URLError, TimeoutError, OSError) as exc:
-                self.root.after(0, lambda: self.status_var.set(f"Не удалось проверить обновления: {exc}"))
+                _msg = f"Не удалось проверить обновления: {exc}"
+                self.root.after(0, lambda m=_msg: self.status_var.set(m))
                 return
             except Exception as exc:
-                self.root.after(0, lambda: self.status_var.set(f"Ошибка проверки обновлений: {exc}"))
+                _msg = f"Ошибка проверки обновлений: {exc}"
+                self.root.after(0, lambda m=_msg: self.status_var.set(m))
                 return
 
             if not is_newer_version(remote_version, self.local_version):

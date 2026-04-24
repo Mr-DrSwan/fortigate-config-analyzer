@@ -1,5 +1,8 @@
 # FortiGate Config Analyzer
 
+[![CI](https://github.com/Mr-DrSwan/fortigate-config-analyzer/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/Mr-DrSwan/fortigate-config-analyzer/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Mr-DrSwan/fortigate-config-analyzer/branch/main/graph/badge.svg)](https://codecov.io/gh/Mr-DrSwan/fortigate-config-analyzer)
+
 ![Forti meme cover](assets/cover-meme.png)
 
 Разбирает конфиг FortiGate (`.conf`) и генерирует читаемый Excel-отчёт.

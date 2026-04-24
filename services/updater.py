@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple
 from urllib.request import urlopen
 
 from security_utils import parse_sha256_file, sha256_file
