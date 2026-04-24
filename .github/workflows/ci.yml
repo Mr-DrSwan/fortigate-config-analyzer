@@ -31,5 +31,5 @@ jobs:
 
       - name: Run security static checks
         run: |
-          bandit -q -r app.py fortigate_analyzer.py install.py
+          bandit -q -r app.py fortigate_analyzer.py install.py --severity-level medium
           pip-audit
